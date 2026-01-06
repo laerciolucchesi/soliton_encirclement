@@ -162,11 +162,13 @@ $$
 
 ### E. Mapping to tangential velocity
 
-The tangential speed magnitude is proportional to $u_i$. A radius-based scaling reduces sensitivity to residual radial error:
+The tangential speed magnitude is proportional to $u_i$ and scaled by an effective radius:
 
 $$
-s = \frac{r_i}{R}, \qquad v_{\tau,mag} = K_{\tau}\,u_i\,s.
+r_{eff} = \max(r_i, R_{min}), \qquad v_{\tau,mag} = K_{\tau}\,u_i\,r_{eff}.
 $$
+
+This yields an induced angular rate $\omega \approx v_{\tau}/r_i \approx K_{\tau} u_i$ for $r_i > R_{min}$, independent of $R$.
 
 The tangential velocity contribution is:
 

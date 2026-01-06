@@ -139,11 +139,17 @@ where:
 
 Then $u$ is converted into a tangential velocity in the XY plane:
 
-$$v_{\tau} = (K_{\tau}\,u\,s)\,\hat t$$
+$$v_{\tau} = (K_{\tau}\,u\,r_{eff})\,\hat t$$
 
-where $\hat t$ is the tangential unit direction around the target and $s$ is a radius-based scale factor:
+where $\hat t$ is the tangential unit direction around the target and:
 
-$$s = \frac{r}{R}\ (\text{best-effort; fallback } s=1)$$
+$$r_{eff} = \max(r, R_{min}).$$
+
+This keeps the induced angular rate approximately:
+
+$$\omega = \frac{v_{\tau}}{r} \approx K_{\tau}\,u \quad (r > R_{min}),$$
+
+independent of the design radius $R$.
 
 ### Final commanded velocity
 

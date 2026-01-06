@@ -19,7 +19,7 @@ CONTROL_LOOP_TIMER_STR: str = "control_loop_timer"
 TARGET_STATE_BROADCAST_TIMER_STR: str = "broadcast_timer"
 
 # Simulation defaults (used by main simulation entrypoints)
-SIM_DURATION: float = 30            # Simulation duration (seconds)
+SIM_DURATION: float = 120           # Simulation duration (seconds)
 SIM_REAL_TIME: bool = True          # Run in real time
 SIM_DEBUG: bool = False             # Enable simulator debug mode
 
@@ -59,7 +59,7 @@ VM_TELEMETRY_DECIMATION: int = 1    # Send telemetry every update
 # changing direction randomly at a fixed period.
 TARGET_MOTION_TIMER_STR: str = "target_motion_timer"
 TARGET_MOTION_PERIOD: float = 1.0        # change velocity direction every this many seconds
-TARGET_MOTION_SPEED_XY: float = 10.0      # target speed (m/s)
+TARGET_MOTION_SPEED_XY: float = 5.0      # target speed (m/s)
 TARGET_MOTION_BOUNDARY_XY: float = 30.0  # meters; if |x| or |y| exceeds this, steer back to (0,0)
 
 # --------------------------------------------------------------------------------------
@@ -79,7 +79,7 @@ FAILURE_CHECK_TIMER_STR: str = "failure_check_timer"
 FAILURE_RECOVER_TIMER_STR: str = "failure_recover_timer"
 FAILURE_ENABLE: bool = True           # Whether to enable failure injection
 FAILURE_CHECK_PERIOD: float = 0.1     # seconds
-FAILURE_MEAN_FAILURES_PER_MIN: float = 1.0  # mean failures per minute
+FAILURE_MEAN_FAILURES_PER_MIN: float = 2.0  # mean failures per minute
 FAILURE_OFF_TIME: float = 8.0         # seconds
 FAILURE_RANDOM_SEED = None            # set to an int for reproducibility
 
@@ -104,6 +104,11 @@ PRUNE_EXPIRED_STATES: bool = True
 # Swarm/encirclement defaults
 NUM_AGENTS: int = 10                # Number of agent nodes
 ENCIRCLEMENT_RADIUS: float = 25.0   # Desired encirclement radius in meters
+
+# Minimum effective radius used by the tangential mapping to avoid division by
+# near-zero radii and to keep the angular-rate interpretation well-conditioned.
+# This does NOT change the desired encirclement radius; it only bounds r_eff.
+R_MIN: float = 1.0
 
 # --------------------------------------------------------------------------------------
 # 8) Radial Controller (Proportional & Derivative terms)
@@ -142,11 +147,11 @@ K_DR: float = 0.5
 #
 #   2) Then we convert u into a tangential velocity vector in the XY plane:
 #
-#      v_tau_vec = (K_TAU * u * speed_scale) * t_hat
+#      v_tau_vec = (K_TAU * u * r_eff) * t_hat
 #
 #      where t_hat is the unit tangential direction around the target and
-#      speed_scale = r_xy / ENCIRCLEMENT_RADIUS (best-effort) to reduce sensitivity
-#      to residual radial error.
+#      r_eff = max(r_xy, R_MIN). This yields an induced angular rate
+#      omega ≈ v_tau / r ≈ K_TAU * u (for r > R_MIN), independent of ENCIRCLEMENT_RADIUS.
 
 # Optional alternative to the cubic containment term (-ALPHA_U*u^3):
 #
@@ -158,7 +163,7 @@ USE_SOFT_LIMITER_U: bool = False  # Whether to use soft limiter on u update
 U_S: float = 2.0                  # Soft limiter scale (only used if USE_SOFT_LIMITER_U is True)
 
 # Tangential controller gains
-K_TAU: float = 3.5        # tangential control gain
+K_TAU: float = 0.2        # tangential control gain
 BETA_U: float = 7.0       # linear damping coefficient
 ALPHA_U: float = 0.5      # nonlinear amplitude containment
 C_COUPLING: float = 2.0   # antisymmetric coupling strength
@@ -169,4 +174,4 @@ K_E_TAU: float = 25.0     # spacing error injection gain (e_tau multiplier)
 # When enabled, the agent forms an omega reference from its two neighbors and
 # subtracts a proportional term from the spacing error injection:
 #   e_tau_eff = e_tau - K_OMEGA_DAMP * (omega_self - omega_ref)
-K_OMEGA_DAMP: float = 0.0
+K_OMEGA_DAMP: float = 0.1  # angular-rate damping gain (0.0 to disable)

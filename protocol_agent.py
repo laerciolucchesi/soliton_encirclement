@@ -30,6 +30,7 @@ from config_param import (
     HYSTERESIS_RAD,
     PRUNE_EXPIRED_STATES,
     ENCIRCLEMENT_RADIUS,
+    R_MIN,
     K_R,
     K_DR,
     VM_MAX_SPEED_XY,
@@ -105,6 +106,10 @@ class AgentProtocol(IProtocol):
 
         # Soliton internal state (scalar). Start at zero by default.
         self.u: float = 0.0
+
+        # Last commanded velocity (world coordinates). Used by the optional local
+        # angular-rate damping term to estimate omega_self from the command.
+        self.desired_velocity: Tuple[float, float, float] = (0.0, 0.0, 0.0)
 
         # Telemetry logging (in-memory). The main.py creates the CSV and sets the path
         # via environment variable to avoid tight coupling with the simulator builder.
@@ -303,16 +308,17 @@ class AgentProtocol(IProtocol):
         u: float,
         t_hat: Tuple[float, float],
         *,
-        speed_scale: float = 1.0,
+        r_eff: float = 1.0,
     ) -> Tuple[float, float, float]:
         """Convert soliton state into tangential velocity (XYZ).
 
-        Note: scaling the linear tangential speed proportionally to radius helps
-        the controller act on angular rate (omega) instead of raw linear speed.
+        Note: scaling the linear tangential speed by r_eff makes the induced
+        angular rate approximately omega ≈ v_tau / r ≈ K_TAU * u (for r > R_MIN),
+        independent of ENCIRCLEMENT_RADIUS.
         """
-        if not math.isfinite(speed_scale) or speed_scale <= 0.0:
-            speed_scale = 1.0
-        v_tau_corr = K_TAU * u * speed_scale
+        if not math.isfinite(r_eff) or r_eff <= 0.0:
+            r_eff = 1.0
+        v_tau_corr = K_TAU * u * r_eff
         return (v_tau_corr * t_hat[0], v_tau_corr * t_hat[1], 0.0)
 
     @staticmethod
@@ -651,6 +657,16 @@ class AgentProtocol(IProtocol):
                 # Tangential direction in XY plane.
                 t_hat = self.compute_tangential_unit_vector(target_state.position, position)
 
+                # Effective radius used by the tangential mapping and omega estimation.
+                r_xy = math.hypot(position[0] - target_state.position[0], position[1] - target_state.position[1])
+                r_min = float(R_MIN)
+                if not (math.isfinite(r_min) and r_min > 0.0):
+                    r_min = 1e-6
+                if math.isfinite(r_xy):
+                    r_eff = max(r_xy, r_min)
+                else:
+                    r_eff = r_min
+
                 # Local spacing imbalance error uses only neighbor gaps.
                 e_tau = self.compute_spacing_error(pred_gap, succ_gap)
 
@@ -658,12 +674,13 @@ class AgentProtocol(IProtocol):
                 # e_tau_eff = e_tau - K_OMEGA_DAMP * (omega_self - omega_ref)
                 e_tau_eff = float(e_tau)
                 if math.isfinite(K_OMEGA_DAMP) and K_OMEGA_DAMP > 0.0:
-                    omega_self = self.compute_omega_about_target_xy(
-                        target_pos=target_state.position,
-                        target_vel=target_state.velocity,
-                        pos=position,
-                        vel=velocity,
-                    )
+                    # Compute omega_self from the commanded tangential component (m/s) to keep
+                    # the damping term consistent with the tangential mapping. Best-effort.
+                    v_cmd_prev = getattr(self, "desired_velocity", (0.0, 0.0, 0.0))
+                    v_tan_cmd = float(v_cmd_prev[0] * t_hat[0] + v_cmd_prev[1] * t_hat[1])
+                    omega_self = None
+                    if math.isfinite(v_tan_cmd) and math.isfinite(r_eff) and r_eff > 0.0:
+                        omega_self = float(v_tan_cmd / r_eff)
 
                     omega_pred = None
                     omega_succ = None
@@ -711,15 +728,10 @@ class AgentProtocol(IProtocol):
                 if not math.isfinite(self.u):
                     self.u = 0.0
 
-                # Scale tangential linear speed by radius so that commanded angular rate
-                # is less sensitive to residual radial error.
-                r_xy = math.hypot(position[0] - target_state.position[0], position[1] - target_state.position[1])
-                if math.isfinite(r_xy) and r_xy > 1e-6 and math.isfinite(ENCIRCLEMENT_RADIUS) and ENCIRCLEMENT_RADIUS > 1e-6:
-                    speed_scale = r_xy / ENCIRCLEMENT_RADIUS
-                else:
-                    speed_scale = 1.0
-
-                v_tau = self.compute_tangential_velocity(self.u, t_hat, speed_scale=speed_scale)
+                # Tangential velocity mapping (linear m/s command):
+                #   v_tau = (K_TAU * u * r_eff) * t_hat
+                # This yields omega ≈ v_tau/r ≈ K_TAU * u (for r > R_MIN), independent of R.
+                v_tau = self.compute_tangential_velocity(self.u, t_hat, r_eff=r_eff)
 
                 if SIM_DEBUG:
                     print(
