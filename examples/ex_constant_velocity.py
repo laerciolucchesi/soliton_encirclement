@@ -1,7 +1,7 @@
 """Core-only example (no GrADyS-SIM runtime required).
 
 This script demonstrates the *pure* mathematical functions exposed by
-`gradysim_velocity_mobility.core`:
+`velocity_mobility.core`:
 
 - acceleration-limited velocity tracking
 - velocity saturation
@@ -15,7 +15,7 @@ Usage:
     python .\examples\ex_constant_velocity.py
 """
 
-from gradysim_velocity_mobility import (
+from velocity_mobility import (
     VelocityMobilityConfiguration,
     apply_acceleration_limits,
     apply_velocity_limits,

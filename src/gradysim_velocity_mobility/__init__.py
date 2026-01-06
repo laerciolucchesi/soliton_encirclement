@@ -1,33 +1,31 @@
-"""
-GrADyS-SIM NG Velocity Mobility Handler
+"""Compatibility shim for the legacy module name.
 
-A velocity-driven mobility handler for the GrADyS-SIM NG simulator,
-designed for distributed controllers that output velocity vectors.
+The implementation has moved to the `velocity_mobility` package.
 
-Key features:
-- Direct velocity control (no waypoints)
-- Independent horizontal and vertical constraints
-- Acceleration-limited velocity tracking
-- Optional telemetry emission
+This module keeps backward compatibility for existing code that imports:
 
-Author: Laércio Lucchesi
-Date: December 27, 2025
+- `gradysim_velocity_mobility`
+- `gradysim_velocity_mobility.core`
+- `gradysim_velocity_mobility.config`
+- `gradysim_velocity_mobility.handler`
 """
 
-from .config import VelocityMobilityConfiguration
-from .handler import VelocityMobilityHandler
-from .core import (
+from velocity_mobility import (  # noqa: F401
+    VelocityMobilityConfiguration,
+    VelocityMobilityHandler,
     apply_acceleration_limits,
     apply_velocity_limits,
-    integrate_position
+    apply_velocity_tracking_first_order,
+    integrate_position,
 )
 
-__version__ = "0.1.0"
+from velocity_mobility import __version__  # noqa: F401
 
 __all__ = [
     "VelocityMobilityConfiguration",
     "VelocityMobilityHandler",
     "apply_acceleration_limits",
     "apply_velocity_limits",
+    "apply_velocity_tracking_first_order",
     "integrate_position",
 ]

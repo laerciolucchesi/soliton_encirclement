@@ -1,198 +1,130 @@
-"""Simple velocity-based mobility example with visualization.
-
-This script builds a GrADyS-SIM simulation with a single node controlled by
-VelocityMobilityHandler. The node's velocity is commanded by VelocityProtocol
-in initialize(), and then changed periodically via a timer (every 10 seconds).
-
-Initial node position is set in builder.add_node().
+"""This script builds a GrADyS-SIM simulation with a 1 target node and n agent 
+nodes controlled by soliton-like to enforce encirclement behavior.
+The target node moves according to a random trajectory, while the agent nodes
+attempt to encircle the target at a specified radius equally spaced between them.
+Run:
+    python main.py
 """
 
-import logging
-
 # Suppress websockets handshake warnings
+import logging
 logging.getLogger('websockets').setLevel(logging.CRITICAL)
+
+import os
+from datetime import datetime
 
 from gradysim.simulator.handler.communication import CommunicationHandler, CommunicationMedium
 from gradysim.simulator.handler.timer import TimerHandler
 from gradysim.simulator.handler.visualization import VisualizationHandler, VisualizationConfiguration
 from gradysim.simulator.simulation import SimulationBuilder, SimulationConfiguration
-from gradysim_velocity_mobility import VelocityMobilityHandler, VelocityMobilityConfiguration
-from protocol import VelocityProtocol
+from protocol_target import TargetProtocol
+from protocol_agent import AgentProtocol
+from velocity_mobility import VelocityMobilityHandler, VelocityMobilityConfiguration
+from config_param import (
+    COMMUNICATION_DELAY,
+    COMMUNICATION_FAILURE_RATE,
+    COMMUNICATION_TRANSMISSION_RANGE,
+    ENCIRCLEMENT_RADIUS,
+    NUM_AGENTS,
+    SIM_DEBUG,
+    SIM_DURATION,
+    SIM_REAL_TIME,
+    VIS_OPEN_BROWSER,
+    VIS_UPDATE_RATE,
+    VM_MAX_ACC_XY,
+    VM_MAX_ACC_Z,
+    VM_MAX_SPEED_XY,
+    VM_MAX_SPEED_Z,
+    VM_SEND_TELEMETRY,
+    VM_TAU_XY,
+    VM_TAU_Z,
+    VM_TELEMETRY_DECIMATION,
+    VM_UPDATE_RATE,
+)
+import math
+import random
 
 
-# ============================================================
-# Mobility presets (choose by editing ONE variable)
-#
-# Profiles: Cinematic, Survey, Cargo, Racing, Micro, Custom
-# - For the first five profiles, values below are ALREADY the final values
-#   (80% of the README table maxima, rounded to the same decimals as the table).
-# - Custom uses the explicit values defined below (the original values).
-# ============================================================
-
-MOBILITY_PROFILE: str = "Cargo"  # Choose mobility profile here
-
-
-CUSTOM_MOBILITY_CONFIG = VelocityMobilityConfiguration(
-    update_rate=0.01,        # Update every 0.01 seconds
-    max_speed_xy=5.0,        # Max horizontal speed: 5 m/s
-    max_speed_z=5.0,         # Max vertical speed: 5 m/s
-    max_acc_xy=2.5,          # Max horizontal acceleration: 2.5 m/s²
-    max_acc_z=2.5,           # Max vertical acceleration: 2.5 m/s²
-    tau_xy=0.5,              # Optional: 1st-order horizontal tracking time constant (s)
-    tau_z=0.8,               # Optional: 1st-order vertical tracking time constant (s)
-    send_telemetry=True,     # Enable telemetry
-    telemetry_decimation=1,  # Send telemetry every update
+mobility_config = VelocityMobilityConfiguration(
+    update_rate=VM_UPDATE_RATE,        # Update every in seconds
+    max_speed_xy=VM_MAX_SPEED_XY,      # Max horizontal speed in m/s
+    max_speed_z=VM_MAX_SPEED_Z,        # Max vertical speed in m/s
+    max_acc_xy=VM_MAX_ACC_XY,          # Max horizontal acceleration in m/s²
+    max_acc_z=VM_MAX_ACC_Z,            # Max vertical acceleration in m/s²
+    tau_xy=VM_TAU_XY,                  # Optional: 1st-order horizontal tracking time constant (s)
+    tau_z=VM_TAU_Z,                    # Optional: 1st-order vertical tracking time constant (s)
+    send_telemetry=VM_SEND_TELEMETRY,  # Enable telemetry
+    telemetry_decimation=VM_TELEMETRY_DECIMATION,  # Send telemetry every update
 )
 
 
-MOBILITY_PRESETS: dict[str, VelocityMobilityConfiguration] = {
-    "Cinematic": VelocityMobilityConfiguration(
-        update_rate=0.04,
-        max_speed_xy=10.0,
-        max_speed_z=5.0,
-        max_acc_xy=4.0,
-        max_acc_z=5.0,
-        tau_xy=1.0,
-        tau_z=1.2,
-        send_telemetry=True,
-        telemetry_decimation=1,
-    ),
-    "Survey": VelocityMobilityConfiguration(
-        update_rate=0.04,
-        max_speed_xy=12.0,
-        max_speed_z=2.0,
-        max_acc_xy=3.0,
-        max_acc_z=4.0,
-        tau_xy=1.0,
-        tau_z=1.4,
-        send_telemetry=True,
-        telemetry_decimation=1,
-    ),
-    "Cargo": VelocityMobilityConfiguration(
-        update_rate=0.04,
-        max_speed_xy=8.0,
-        max_speed_z=3.0,
-        max_acc_xy=2.0,
-        max_acc_z=4.0,
-        tau_xy=1.2,
-        tau_z=1.6,
-        send_telemetry=True,
-        telemetry_decimation=1,
-    ),
-    "Racing": VelocityMobilityConfiguration(
-        update_rate=0.02,
-        max_speed_xy=32.0,
-        max_speed_z=16.0,
-        max_acc_xy=20.0,
-        max_acc_z=20.0,
-        tau_xy=0.3,
-        tau_z=0.5,
-        send_telemetry=True,
-        telemetry_decimation=1,
-    ),
-    "Micro": VelocityMobilityConfiguration(
-        update_rate=0.02,
-        max_speed_xy=5.0,
-        max_speed_z=2.0,
-        max_acc_xy=8.0,
-        max_acc_z=10.0,
-        tau_xy=0.6,
-        tau_z=0.7,
-        send_telemetry=True,
-        telemetry_decimation=1,
-    ),
-    "Custom": CUSTOM_MOBILITY_CONFIG,
-}
-
-
 def main():
-    """Execute the velocity mobility simulation."""
-    
-    # Simulation parameters
-    duration = 50  # Simulation duration in seconds
-    debug = False  # Simulation debug mode
-    real_time = True  # Simulation real time mode - True to see movement in real-time
+    """Execute the simulation."""
+
+    # Create a shared CSV file for agent telemetry logs.
+    # Each agent will append its rows on protocol finish().
+    csv_path = os.path.join(os.getcwd(), "agent_telemetry.csv")
+    os.environ["AGENT_LOG_CSV_PATH"] = csv_path
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("node_id,timestamp,u,velocity_norm\n")
+
+    # Create a shared CSV file for target telemetry logs.
+    # The target will append its rows on protocol finish().
+    target_csv_path = os.path.join(os.getcwd(), "target_telemetry.csv")
+    os.environ["TARGET_LOG_CSV_PATH"] = target_csv_path
+    with open(target_csv_path, "w", encoding="utf-8") as f:
+        f.write("timestamp,global_radial_error,global_tangential_error\n")
+
+    duration = SIM_DURATION        # Simulation duration (seconds)
+    real_time = SIM_REAL_TIME      # Run in real time (True) or as-fast-as-possible (False)
+    debug = SIM_DEBUG              # Enable simulator debug mode
+
     builder = SimulationBuilder(
         SimulationConfiguration(
             duration=duration,
             debug=debug,
-            real_time=real_time
+            real_time=real_time,
         )
     )
-    
-    # Add the communication handler
-    transmission_range = 200  # Communication transmission range in meters
-    delay = 0.0  # Communication delay in seconds
-    failure_rate = 0.0  # Communication failure rate in percentage
+
+    transmission_range = COMMUNICATION_TRANSMISSION_RANGE  # Communication range (meters)
+    delay = COMMUNICATION_DELAY                       # Communication delay (seconds)
+    failure_rate = COMMUNICATION_FAILURE_RATE         # Packet loss probability [0.0, 1.0]
     medium = CommunicationMedium(
         transmission_range=transmission_range,
         delay=delay,
-        failure_rate=failure_rate
+        failure_rate=failure_rate,
     )
     builder.add_handler(CommunicationHandler(medium))
-    
-    # Add the timer handler
-    builder.add_handler(TimerHandler())
-    
-    # Add the velocity mobility handler
-    # Quadrotor trajectory-level model (velocity command tracking):
-    # - The protocol commands a desired velocity v_des.
-    # - The handler updates the effective velocity v with bounded acceleration.
-    # - Optionally, tau_* adds a 1st-order lag (exponential-like response) before
-    #   acceleration saturation, which often matches real quadrotor “feel”.
-    #
-    # Typical starting ranges (very approximate; tune for your platform):
-    # - update_rate: 0.01–0.05 s
-    # - max_speed_xy: 3–15 m/s
-    # - max_speed_z:  1–8 m/s
-    # - max_acc_xy:   2–8 m/s^2
-    # - max_acc_z:    2–10 m/s^2
-    # - tau_xy:       0.3–0.8 s (optional)
-    # - tau_z:        0.5–1.2 s (optional)
-    profile = (MOBILITY_PROFILE or "").strip()
-    mobility_config = MOBILITY_PRESETS.get(profile)
-    if mobility_config is None:
-        valid = ", ".join(sorted(MOBILITY_PRESETS.keys()))
-        raise ValueError(f"Unknown MOBILITY_PROFILE={MOBILITY_PROFILE!r}. Valid options: {valid}")
 
-    print(
-        "Mobility preset: "
-        f"{profile} "
-        f"(update_rate={mobility_config.update_rate}, "
-        f"max_speed_xy={mobility_config.max_speed_xy}, max_speed_z={mobility_config.max_speed_z}, "
-        f"max_acc_xy={mobility_config.max_acc_xy}, max_acc_z={mobility_config.max_acc_z}, "
-        f"tau_xy={mobility_config.tau_xy}, tau_z={mobility_config.tau_z})"
-    )
+    builder.add_handler(TimerHandler())
+
     velocity_handler = VelocityMobilityHandler(mobility_config)
     builder.add_handler(velocity_handler)
-    
-    # Add the visualization handler
+
     vis_config = VisualizationConfiguration(
-        open_browser=True,
-        update_rate=0.1  # Update visualization every 0.1 seconds
+        open_browser=VIS_OPEN_BROWSER,
+        update_rate=VIS_UPDATE_RATE,
     )
     builder.add_handler(VisualizationHandler(vis_config))
-    
-    # Add a single node at position (-25, -25, -25) - initial position
-    builder.add_node(VelocityProtocol, (-25, -25, -25))
-    
-    # Build and start simulation
-    simulation = builder.build()
-    print("=" * 60)
-    print("Starting velocity mobility simulation")
-    print("Node velocity is commanded by VelocityProtocol (and changes every 10 seconds)")
-    print("Starting position: (-25, -25, -25)")
-    print("Visualization will open in browser automatically")
-    print("=" * 60)
-    try:
-        simulation.start_simulation()
-    except (BrokenPipeError, EOFError) as e:
-        logging.getLogger(__name__).debug(f"Ignored visualization shutdown error: {e}")
-    finally:
-        print("=" * 60)
-        print("Simulation completed!")
-        print("=" * 60)
 
+    # Add target node at origin
+    builder.add_node(TargetProtocol, (0, 0, 0))
+
+    # Add agent nodes at random positions around the target
+    # and randomly vary the desired encirclement radius
+
+    num_agents = NUM_AGENTS # Number of agent nodes
+    encirclement_radius = ENCIRCLEMENT_RADIUS # Desired encirclement radius in meters
+    for i in range(num_agents):
+        angle = random.uniform(0, 2 * math.pi)
+        x = encirclement_radius * random.uniform(0.8, 1.2) * math.cos(angle)
+        y = encirclement_radius * random.uniform(0.8, 1.2) * math.sin(angle)
+        z = 0.0 # Keep agents at ground level
+        builder.add_node(AgentProtocol, (x, y, z))
+
+    simulation = builder.build()
+    simulation.start_simulation()
 
 if __name__ == "__main__":
     main()

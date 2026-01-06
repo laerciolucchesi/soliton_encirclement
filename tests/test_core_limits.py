@@ -7,7 +7,7 @@ acceleration limiting in the core module.
 
 import pytest
 import math
-from gradysim_velocity_mobility.core import (
+from velocity_mobility.core import (
     apply_velocity_limits,
     apply_acceleration_limits,
     apply_velocity_tracking_first_order,

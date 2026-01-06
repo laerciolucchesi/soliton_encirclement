@@ -6,7 +6,7 @@ based on velocity and time step.
 """
 
 import pytest
-from gradysim_velocity_mobility.core import integrate_position
+from velocity_mobility.core import integrate_position
 
 
 class TestPositionIntegration:

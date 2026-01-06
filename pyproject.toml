@@ -3,16 +3,16 @@ requires = ["setuptools>=65.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gradysim-velocity-mobility"
+name = "soliton-encirclement"
 version = "0.1.0"
-description = "Velocity-driven mobility handler for GrADyS-SIM NG"
+description = "Soliton-inspired swarm encirclement project (includes reusable velocity mobility components)"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
-    {name = "GrADyS-SIM NG Contributors"}
+    {name = "Laércio Lucchesi", email = "laercio.lucchesi@gmail.com"}
 ]
-keywords = ["simulation", "mobility", "gradysim", "swarm", "robotics"]
+keywords = ["simulation", "mobility", "encirclement", "gradysim", "swarm", "robotics"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -37,17 +37,17 @@ dev = [
     "pytest-cov>=4.0",
 ]
 
-[project.urls]
-Homepage = "https://github.com/Project-GrADyS/gradys-sim-nextgen"
-Documentation = "https://project-gradys.github.io/gradys-sim-nextgen/"
-Repository = "https://github.com/Project-GrADyS/gradys-sim-nextgen"
+
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["gradysim_velocity_mobility*"]
+include = [
+    "velocity_mobility*",
+    "gradysim_velocity_mobility*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
