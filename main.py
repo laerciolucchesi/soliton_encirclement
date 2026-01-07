@@ -73,7 +73,7 @@ def main():
     target_csv_path = os.path.join(os.getcwd(), "target_telemetry.csv")
     os.environ["TARGET_LOG_CSV_PATH"] = target_csv_path
     with open(target_csv_path, "w", encoding="utf-8") as f:
-        f.write("timestamp,global_radial_error,global_tangential_error\n")
+        f.write("timestamp,E_r,E_vr,rho,G_max,E_gap\n")
 
     duration = SIM_DURATION        # Simulation duration (seconds)
     real_time = SIM_REAL_TIME      # Run in real time (True) or as-fast-as-possible (False)

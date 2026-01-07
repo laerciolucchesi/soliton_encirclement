@@ -186,20 +186,36 @@ If a mobility handler exists, it can also move in the XY plane:
 - every `TARGET_MOTION_PERIOD` the target chooses a new velocity direction
 - if it is outside `TARGET_MOTION_BOUNDARY_XY`, it steers back toward the origin
 
-### Global error metrics (RMS)
+### Encirclement metrics (target telemetry)
 
 The target maintains a cache of recent `AgentState` messages and (optionally) prunes expired entries.
-It computes two global errors (RMS) over currently alive agents/gaps:
+At each telemetry tick it computes five metrics over the currently alive agents in the XY plane.
+Let $M$ be the number of valid alive agents used at that instant, $r_j=\|p_{j,xy}-p_{T,xy}\|$, and
+$\theta_j=\mathrm{atan2}(y_j-y_T,\,x_j-x_T)$ wrapped to $[0,2\pi)$.
 
-- Global radial error (RMS):
-    $$e_{r,j} = \frac{\|p_j - p_T\|}{R} - 1,\qquad E_r = \sqrt{\frac{1}{M}\sum_j e_{r,j}^2}$$
-    where $M$ is the number of valid alive agent terms.
+- **Normalized radial orbit error (RMS)** `E_r` (dimensionless):
+    $$e_{r,j} = \frac{r_j}{R} - 1,\qquad E_r = \sqrt{\frac{1}{M}\sum_j e_{r,j}^2}.$$
 
-- Global tangential error (RMS):
-    - sort alive agents by target-centric angle
-    - compute angular gaps $\Delta\theta_i$ on the circle
-    - with ideal gap $\Delta\theta^* = 2\pi/N$ for the current number of alive agents $N$:
-        $$e_{\tau,i} = \frac{\Delta\theta_i}{\Delta\theta^*} - 1,\qquad E_\tau = \sqrt{\frac{1}{N}\sum_i e_{\tau,i}^2}$$
+- **Radial speed (RMS)** `E_vr` (m/s):
+    $$v_{r,j} = (v_{j,xy}-v_{T,xy})\cdot \hat e_{r,j},\qquad E_{vr} = \sqrt{\frac{1}{M}\sum_j v_{r,j}^2},$$
+    where $\hat e_{r,j}=(p_{j,xy}-p_{T,xy})/r_j$.
+
+- **Kuramoto order parameter** `rho` (dimensionless, in $[0,1]$):
+    $$\rho = \left|\frac{1}{M}\sum_j e^{i\theta_j}\right|.$$
+
+- **Normalized maximum angular gap** `G_max` (dimensionless, worst-case spacing):
+    - sort alive agents by angle, compute gaps $\Delta\theta_k$ around the circle
+    - ideal gap $\Delta\theta^*=2\pi/M$
+    $$G_{max} = \max_k \frac{\Delta\theta_k}{\Delta\theta^*}.$$
+
+- **RMS normalized angular spacing error** `E_gap` (dimensionless, average-case spacing):
+    $$e_{gap,k} = \frac{\Delta\theta_k}{\Delta\theta^*} - 1,\qquad E_{gap} = \sqrt{\frac{1}{M}\sum_k e_{gap,k}^2}.$$
+
+The target writes these metrics to `target_telemetry.csv` with columns:
+`timestamp,E_r,E_vr,rho,G_max,E_gap`
+
+It also saves one PNG per metric next to the CSV:
+`metric_E_r.png`, `metric_E_vr.png`, `metric_rho.png`, `metric_G_max.png`, `metric_E_gap.png`.
 
 ## Parameters
 

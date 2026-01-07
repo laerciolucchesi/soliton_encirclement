@@ -224,78 +224,124 @@ class TargetProtocol(IProtocol):
             return
 
         target_pos = self.velocity_handler.get_node_position(self.node_id)
+        target_vel = self.velocity_handler.get_node_velocity(self.node_id)
+        if target_pos is None:
+            return
+        if target_vel is None:
+            target_vel = (0.0, 0.0, 0.0)
 
-        # Compute global radial error (RMS) over all alive agent nodes.
-        # For each alive node j:
-        #   e_j = ||p_j - p_target||/R - 1
-        # Then compute RMS:
-        #   E_rms = sqrt((1/M) * sum_j e_j^2)
-        # where M is the number of valid (finite) terms accumulated.
-        sum_sq = 0.0
-        count = 0
+        # Compute 5 encirclement metrics over currently alive agents.
+        # Notation uses the XY plane only.
+        #   E_r   : RMS normalized radial orbit error (dimensionless)
+        #   E_vr  : RMS radial speed (m/s)
+        #   rho   : Kuramoto order parameter in [0, 1]
+        #   G_max : max_k (Delta theta_k / (2*pi/M)) using M = alive agents (dimensionless)
+        #   E_gap : RMS normalized angular spacing error (dimensionless)
+
+        two_pi = 2.0 * math.pi
+        R = float(ENCIRCLEMENT_RADIUS)
+
+        # Accumulators
+        sum_sq_Er = 0.0
+        count_Er = 0
+
+        sum_sq_vr = 0.0
+        count_vr = 0
+
+        angles = []
+        sum_cos = 0.0
+        sum_sin = 0.0
+        count_theta = 0
+
         for _agent_id, (state, _rxtime) in self.agent_states.items():
             dx = float(state.position[0] - target_pos[0])
             dy = float(state.position[1] - target_pos[1])
             r = math.hypot(dx, dy)
-
-            if not (math.isfinite(r) and math.isfinite(ENCIRCLEMENT_RADIUS) and ENCIRCLEMENT_RADIUS > 0.0):
+            if not (math.isfinite(dx) and math.isfinite(dy) and math.isfinite(r) and r > 1e-9):
                 continue
 
-            e = (r / ENCIRCLEMENT_RADIUS) - 1.0
-            if not math.isfinite(e):
-                continue
-            sum_sq += e * e
-
-            count += 1
-
-        global_radial_error = float(math.sqrt(sum_sq / count)) if count > 0 else 0.0
-
-        # Compute global tangential error (RMS) using the angular gaps between neighbors.
-        # Steps:
-        #   1) ideal_angle = 2*pi/N
-        #   2) for each gap (neighbors in sorted angular order): e = gap/ideal_angle - 1
-        #   3) accumulate sum of squares and number of valid terms
-        #   4) global_tangential_error = sqrt(sum_sq / count)
-        angles = []
-        two_pi = 2.0 * math.pi
-        for _agent_id, (state, _rxtime) in self.agent_states.items():
-            dx = float(state.position[0] - target_pos[0])
-            dy = float(state.position[1] - target_pos[1])
+            # theta in [0, 2*pi)
             theta = math.atan2(dy, dx)
             if not math.isfinite(theta):
                 continue
             theta = (theta + two_pi) % two_pi
             angles.append(theta)
+            sum_cos += math.cos(theta)
+            sum_sin += math.sin(theta)
+            count_theta += 1
 
+            # E_r: normalized radial orbit error
+            if math.isfinite(R) and R > 0.0:
+                e_r = (r / R) - 1.0
+                if math.isfinite(e_r):
+                    sum_sq_Er += e_r * e_r
+                    count_Er += 1
+
+            # E_vr: RMS radial speed (relative to the target)
+            vx = float(state.velocity[0] - target_vel[0])
+            vy = float(state.velocity[1] - target_vel[1])
+            if math.isfinite(vx) and math.isfinite(vy):
+                e_rx = dx / r
+                e_ry = dy / r
+                v_r = vx * e_rx + vy * e_ry
+                if math.isfinite(v_r):
+                    sum_sq_vr += v_r * v_r
+                    count_vr += 1
+
+        # Metric 1: E_r
+        E_r = float(math.sqrt(sum_sq_Er / count_Er)) if count_Er > 0 else 0.0
+
+        # Metric 2: E_vr
+        E_vr = float(math.sqrt(sum_sq_vr / count_vr)) if count_vr > 0 else 0.0
+
+        # Metric 3: rho (Kuramoto order parameter)
+        if count_theta > 0:
+            z_re = sum_cos / float(count_theta)
+            z_im = sum_sin / float(count_theta)
+            rho = float(math.hypot(z_re, z_im))
+        else:
+            rho = 0.0
+
+        # Metrics 4 and 5: G_max and E_gap from sorted angular gaps
         angles.sort()
-        n = len(angles)
-        sum_sq_tan = 0.0
-        count_tan = 0
-        if n > 0:
-            ideal_angle = two_pi / float(n)
-            if math.isfinite(ideal_angle) and ideal_angle > 0.0:
-                for i in range(n):
-                    if i < n - 1:
+        M = len(angles)
+        G_max = 0.0
+        E_gap = 0.0
+        if M > 0:
+            ideal_gap = two_pi / float(M)
+            if math.isfinite(ideal_gap) and ideal_gap > 0.0:
+                max_ratio = 0.0
+                sum_sq_gap = 0.0
+                count_gap = 0
+                for i in range(M):
+                    if i < M - 1:
                         gap = angles[i + 1] - angles[i]
                     else:
                         gap = angles[0] + two_pi - angles[-1]
 
                     if not math.isfinite(gap):
                         continue
-                    e_tan = (gap / ideal_angle) - 1.0
-                    if not math.isfinite(e_tan):
-                        continue
-                    sum_sq_tan += e_tan * e_tan
 
-                    count_tan += 1
+                    ratio = gap / ideal_gap
+                    if math.isfinite(ratio):
+                        if ratio > max_ratio:
+                            max_ratio = ratio
+                        e_gap = ratio - 1.0
+                        if math.isfinite(e_gap):
+                            sum_sq_gap += e_gap * e_gap
+                            count_gap += 1
 
-        global_tangential_error = float(math.sqrt(sum_sq_tan / count_tan)) if count_tan > 0 else 0.0
+                G_max = float(max_ratio) if count_gap > 0 else 0.0
+                E_gap = float(math.sqrt(sum_sq_gap / count_gap)) if count_gap > 0 else 0.0
 
         self._telemetry_rows.append(
             {
                 "timestamp": now,
-                "global_radial_error": global_radial_error,
-                "global_tangential_error": global_tangential_error,
+                "E_r": E_r,
+                "E_vr": E_vr,
+                "rho": rho,
+                "G_max": G_max,
+                "E_gap": E_gap,
             }
         )
 
@@ -306,7 +352,7 @@ class TargetProtocol(IProtocol):
         try:
             df = pd.DataFrame(
                 self._telemetry_rows,
-                columns=["timestamp", "global_radial_error", "global_tangential_error"],
+                columns=["timestamp", "E_r", "E_vr", "rho", "G_max", "E_gap"],
             )
 
             # Append without header; main.py already created the file with header.
@@ -318,39 +364,87 @@ class TargetProtocol(IProtocol):
             if plt is not None:
                 plot_df = df.copy()
                 plot_df["timestamp"] = pd.to_numeric(plot_df["timestamp"], errors="coerce")
-                plot_df["global_radial_error"] = pd.to_numeric(plot_df["global_radial_error"], errors="coerce")
-                plot_df["global_tangential_error"] = pd.to_numeric(plot_df["global_tangential_error"], errors="coerce")
+                plot_df["E_r"] = pd.to_numeric(plot_df["E_r"], errors="coerce")
+                plot_df["E_vr"] = pd.to_numeric(plot_df["E_vr"], errors="coerce")
+                plot_df["rho"] = pd.to_numeric(plot_df["rho"], errors="coerce")
+                plot_df["G_max"] = pd.to_numeric(plot_df["G_max"], errors="coerce")
+                plot_df["E_gap"] = pd.to_numeric(plot_df["E_gap"], errors="coerce")
                 plot_df = plot_df.dropna(subset=["timestamp"]).sort_values("timestamp")
 
                 out_dir = os.path.dirname(os.path.abspath(self._csv_path))
 
-                # Preserve radial error plot.
-                radial_df = plot_df.dropna(subset=["global_radial_error"])
-                if not radial_df.empty:
+                def _plot_metric(
+                    metric: str,
+                    *,
+                    title: str,
+                    ylabel: str,
+                    filename: str,
+                    definition: str,
+                ) -> None:
+                    metric_df = plot_df.dropna(subset=[metric])
+                    if metric_df.empty:
+                        return
                     fig, ax = plt.subplots(1, 1, figsize=(10, 4))
-                    ax.plot(radial_df["timestamp"], radial_df["global_radial_error"], linewidth=1.2)
+                    ax.plot(metric_df["timestamp"], metric_df[metric], linewidth=1.2)
+                    ax.set_title(title)
                     ax.set_xlabel("timestamp (s)")
-                    ax.set_ylabel("global_radial_error")
+                    ax.set_ylabel(ylabel)
+                    if definition:
+                        ax.text(
+                            0.98,
+                            0.98,
+                            definition,
+                            transform=ax.transAxes,
+                            va="top",
+                            ha="right",
+                            fontsize=11,
+                            bbox={
+                                "boxstyle": "round,pad=0.25",
+                                "facecolor": "white",
+                                "edgecolor": "black",
+                                "alpha": 0.85,
+                            },
+                        )
                     ax.grid(True, alpha=0.3)
                     fig.tight_layout()
-
-                    radial_png_path = os.path.join(out_dir, "target_telemetry_radial_error.png")
-                    fig.savefig(radial_png_path, dpi=150)
+                    fig.savefig(os.path.join(out_dir, filename), dpi=150)
                     plt.close(fig)
 
-                # Tangential error plot.
-                tangential_df = plot_df.dropna(subset=["global_tangential_error"])
-                if not tangential_df.empty:
-                    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
-                    ax.plot(tangential_df["timestamp"], tangential_df["global_tangential_error"], linewidth=1.2)
-                    ax.set_xlabel("timestamp (s)")
-                    ax.set_ylabel("global_tangential_error")
-                    ax.grid(True, alpha=0.3)
-                    fig.tight_layout()
-
-                    tangential_png_path = os.path.join(out_dir, "target_telemetry_tangential_error.png")
-                    fig.savefig(tangential_png_path, dpi=150)
-                    plt.close(fig)
+                _plot_metric(
+                    "E_r",
+                    title="Normalized radial orbit error (RMS)",
+                    ylabel="E_r",
+                    filename="metric_E_r.png",
+                    definition=r"$E_r(t)=\sqrt{\frac{1}{M}\sum_j\left(\frac{r_j(t)}{R}-1\right)^2}$",
+                )
+                _plot_metric(
+                    "E_vr",
+                    title="Radial speed (RMS)",
+                    ylabel="E_vr (m/s)",
+                    filename="metric_E_vr.png",
+                    definition=r"$E_{vr}(t)=\sqrt{\frac{1}{M}\sum_j v_{r,j}(t)^2}$",
+                )
+                _plot_metric(
+                    "rho",
+                    title="Kuramoto order parameter",
+                    ylabel="rho",
+                    filename="metric_rho.png",
+                    definition=r"$\rho(t)=\left|\frac{1}{M}\sum_j e^{i\theta_j(t)}\right|$",
+                )
+                _plot_metric(
+                    "G_max",
+                    title="Normalized maximum angular gap",
+                    ylabel="G_max",
+                    filename="metric_G_max.png",
+                    definition=r"$G_{\max}(t)=\max_k\frac{\Delta\theta_k(t)}{2\pi/M}$",
+                )
+                _plot_metric(
+                    "E_gap",
+                    title="RMS normalized angular spacing error",
+                    ylabel="E_gap",
+                    filename="metric_E_gap.png",
+                    definition=r"$E_{gap}(t)=\sqrt{\frac{1}{M}\sum_k\left(\frac{\Delta\theta_k(t)}{2\pi/M}-1\right)^2}$",
+                )
         except Exception as exc:
             self._logger.warning(
                 "Target %s: failed to write telemetry CSV (%s): %r",

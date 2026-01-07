@@ -19,8 +19,8 @@ CONTROL_LOOP_TIMER_STR: str = "control_loop_timer"
 TARGET_STATE_BROADCAST_TIMER_STR: str = "broadcast_timer"
 
 # Simulation defaults (used by main simulation entrypoints)
-SIM_DURATION: float = 120           # Simulation duration (seconds)
-SIM_REAL_TIME: bool = True          # Run in real time
+SIM_DURATION: float = 600           # Simulation duration (seconds)
+SIM_REAL_TIME: bool = False          # Run in real time
 SIM_DEBUG: bool = False             # Enable simulator debug mode
 
 # --------------------------------------------------------------------------------------
@@ -79,7 +79,7 @@ FAILURE_CHECK_TIMER_STR: str = "failure_check_timer"
 FAILURE_RECOVER_TIMER_STR: str = "failure_recover_timer"
 FAILURE_ENABLE: bool = True           # Whether to enable failure injection
 FAILURE_CHECK_PERIOD: float = 0.1     # seconds
-FAILURE_MEAN_FAILURES_PER_MIN: float = 2.0  # mean failures per minute
+FAILURE_MEAN_FAILURES_PER_MIN: float = 1.0  # mean failures per minute
 FAILURE_OFF_TIME: float = 8.0         # seconds
 FAILURE_RANDOM_SEED = None            # set to an int for reproducibility
 
