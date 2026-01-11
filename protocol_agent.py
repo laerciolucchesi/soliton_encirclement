@@ -101,6 +101,11 @@ class AgentProtocol(IProtocol):
         self._neighbor_pred_gap: Optional[float] = None
         self._neighbor_succ_gap: Optional[float] = None
 
+        # Local lambda (lp) weights for predecessor/successor spacing.
+        # Defaults to uniform spacing.
+        self.lp_pred: float = 1.0
+        self.lp_succ: float = 1.0
+
         # Broadcast sequence number
         self.agent_state_seq = 1
 
@@ -258,23 +263,70 @@ class AgentProtocol(IProtocol):
         return float(omega)
 
     @staticmethod
-    def compute_spacing_error(gap_pred: Optional[float], gap_succ: Optional[float]) -> float:
-        """Local spacing imbalance error (normalized, no global N required).
+    def compute_spacing_error(gap_pred: Optional[float], gap_succ: Optional[float], lp_pred: float, lp_succ: float) -> float:
+        """Local spacing imbalance error with weighted lambdas for arbitrary spacing.
 
-        Uses only the two local gaps:
-            e_tau = (gap_succ - gap_pred) / (gap_succ + gap_pred)
+        Equilibrium (e_tau = 0) is reached when:
+            lp_pred * gap_succ = lp_succ * gap_pred
 
-        This yields a dimensionless error in [-1, 1] (when gaps are positive),
-        improving conditioning under partial visibility (e.g., limited range).
+        Returns a dimensionless error in [-1, 1] when the weighted gaps are positive.
 
         If gaps are unavailable (e.g., missing neighbors/target), returns 0.0.
         """
         if gap_pred is None or gap_succ is None:
             return 0.0
-        denom = float(gap_succ + gap_pred)
+
+        lp_pred_f = float(lp_pred)
+        lp_succ_f = float(lp_succ)
+        if not (math.isfinite(lp_pred_f) and math.isfinite(lp_succ_f)):
+            return 0.0
+
+        # Weighted contrast calculation
+        num = float(lp_pred_f * float(gap_succ) - lp_succ_f * float(gap_pred))
+        denom = float(lp_pred_f * float(gap_succ) + lp_succ_f * float(gap_pred))
+
         if not math.isfinite(denom) or denom <= 1e-9:
             return 0.0
-        return float((gap_succ - gap_pred) / denom)
+
+        val = float(num / denom)
+        if not math.isfinite(val):
+            return 0.0
+        return val
+
+    def _update_neighbor_lps_from_target(self) -> None:
+        """Update lp_pred/lp_succ using the latest TargetState.alive_lambdas.
+
+        Persistence rule: if an ID is missing from the map, keep the last value.
+        """
+        if self.target_state is None:
+            return
+        ts, _ = self.target_state
+        lambdas = getattr(ts, "alive_lambdas", None) or {}
+        if not isinstance(lambdas, dict):
+            return
+
+        def _lookup(agent_id: Optional[int]) -> Optional[float]:
+            if agent_id is None:
+                return None
+            # JSON may carry keys as strings; normalize both ways.
+            if agent_id in lambdas:
+                return lambdas.get(agent_id)
+            key_str = str(int(agent_id))
+            if key_str in lambdas:
+                return lambdas.get(key_str)
+            return None
+
+        # Convention: lambda_j is associated with the arc (j -> successor(j)).
+        # For agent i, gap_pred is the arc (pred -> i) and gap_succ is the arc (i -> succ).
+        # Therefore: lp_pred = lambda_pred, lp_succ = lambda_self.
+
+        lp = _lookup(self.neighbor_pred_id)
+        if lp is not None and math.isfinite(float(lp)):
+            self.lp_pred = float(lp)
+
+        ls = _lookup(int(self.node_id))
+        if ls is not None and math.isfinite(float(ls)):
+            self.lp_succ = float(ls)
 
     def update_soliton_state(self, *, u: float, u_pred: float, u_succ: float, e_tau: float, dt: float) -> float:
         """Discrete-time soliton-like internal state update.
@@ -524,7 +576,7 @@ class AgentProtocol(IProtocol):
 
             if self._vis is not None:
                 try:
-                    # Restore agent color to blue upon recovery
+                    # Restore agent color upon recovery: blue
                     self._vis.paint_node(self.node_id, (0.0, 0.0, 255.0))
                 except Exception:
                     pass
@@ -577,6 +629,9 @@ class AgentProtocol(IProtocol):
             self.neighbor_succ_id = succ_id
             self._neighbor_pred_gap = pred_gap
             self._neighbor_succ_gap = succ_gap
+
+            # Update lp weights using the latest target broadcast map (best-effort).
+            self._update_neighbor_lps_from_target()
 
             self.neighbor_pred_state = None
             self.neighbor_succ_state = None
@@ -651,6 +706,7 @@ class AgentProtocol(IProtocol):
             # 4) Tangential Control loop logic goes here
 
             v_tau: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+            v_spin: Tuple[float, float, float] = (0.0, 0.0, 0.0)
             if self.target_state is not None:
                 target_state, _ = self.target_state
 
@@ -668,7 +724,7 @@ class AgentProtocol(IProtocol):
                     r_eff = r_min
 
                 # Local spacing imbalance error uses only neighbor gaps.
-                e_tau = self.compute_spacing_error(pred_gap, succ_gap)
+                e_tau = self.compute_spacing_error(pred_gap, succ_gap, self.lp_pred, self.lp_succ)
 
                 # Optional local angular-rate damping using only target + 2-neighbor kinematics.
                 # e_tau_eff = e_tau - K_OMEGA_DAMP * (omega_self - omega_ref)
@@ -714,6 +770,11 @@ class AgentProtocol(IProtocol):
                         if not math.isfinite(e_tau_eff):
                             e_tau_eff = float(e_tau)
 
+                # No additional local gain scaling: rely on K_OMEGA_DAMP tuning when needed.
+                e_tau_used = float(e_tau_eff)
+                if not math.isfinite(e_tau_used):
+                    e_tau_used = 0.0
+
                 # Neighbor soliton states (0.0 if unavailable).
                 u_pred = 0.0
                 u_succ = 0.0
@@ -724,7 +785,7 @@ class AgentProtocol(IProtocol):
 
                 # Update internal soliton state (persistent) and compute tangential velocity.
                 dt = float(self.control_period)
-                self.u = self.update_soliton_state(u=self.u, u_pred=u_pred, u_succ=u_succ, e_tau=e_tau_eff, dt=dt)
+                self.u = self.update_soliton_state(u=self.u, u_pred=u_pred, u_succ=u_succ, e_tau=e_tau_used, dt=dt)
                 if not math.isfinite(self.u):
                     self.u = 0.0
 
@@ -733,16 +794,35 @@ class AgentProtocol(IProtocol):
                 # This yields omega ≈ v_tau/r ≈ K_TAU * u (for r > R_MIN), independent of R.
                 v_tau = self.compute_tangential_velocity(self.u, t_hat, r_eff=r_eff)
 
+                # Extra global spin term from target broadcast:
+                # target specifies desired angular velocity omega_ref (rad/s);
+                # tangential speed is v = omega_ref * r_xy.
+                omega_ref = getattr(target_state, "omega_ref", 0.0)
+                try:
+                    omega_ref = float(omega_ref)
+                except Exception:
+                    omega_ref = 0.0
+
+                if math.isfinite(omega_ref) and omega_ref != 0.0 and math.isfinite(r_xy) and r_xy > 1e-6:
+                    v_spin_xy = omega_ref * r_xy
+                    v_spin = (v_spin_xy * t_hat[0], v_spin_xy * t_hat[1], 0.0)
+
                 if SIM_DEBUG:
                     print(
                         f"Agent {self.node_id} tangential: e_tau={e_tau:.3f}, e_tau_eff={e_tau_eff:.3f}, "
+                        f"e_tau_used={e_tau_used:.3f}, "
                         f"u_pred={u_pred:.3f}, u_succ={u_succ:.3f}, u={self.u:.3f}, v_tau={v_tau}"
                     )
 
             # Final velocity composition and single command application.
-            # v_cmd = v_rad + v_tau + v_target
+            # v_cmd = v_rad + v_tau + v_target + v_spin
             if self.velocity_handler is not None:
-                v_cmd = self.compose_final_velocity(v_rad, v_tau, v_target)
+                v_cmd_base = self.compose_final_velocity(v_rad, v_tau, v_target)
+                v_cmd = (
+                    v_cmd_base[0] + v_spin[0],
+                    v_cmd_base[1] + v_spin[1],
+                    v_cmd_base[2] + v_spin[2],
+                )
 
                 # Guard against NaNs/Infs propagating into the mobility handler.
                 if not (math.isfinite(v_cmd[0]) and math.isfinite(v_cmd[1]) and math.isfinite(v_cmd[2])):
@@ -790,6 +870,16 @@ class AgentProtocol(IProtocol):
                 self.last_seq_target = state.seq
                 rxtime = now
                 self.target_state = (state, rxtime)
+
+                # Best-effort: update lp weights immediately using current neighbor IDs.
+                self._update_neighbor_lps_from_target()
+
+                # Visualization: keep normal nodes blue (failure mode is handled elsewhere).
+                if self._vis is not None:
+                    try:
+                        self._vis.paint_node(self.node_id, (0.0, 0.0, 255.0))
+                    except Exception:
+                        pass
                 if SIM_DEBUG:
                     ts, rxtime = self.target_state
                     print(

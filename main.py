@@ -19,6 +19,7 @@ from gradysim.simulator.handler.visualization import VisualizationHandler, Visua
 from gradysim.simulator.simulation import SimulationBuilder, SimulationConfiguration
 from protocol_target import TargetProtocol
 from protocol_agent import AgentProtocol
+from protocol_adversary import AdversaryProtocol
 from velocity_mobility import VelocityMobilityHandler, VelocityMobilityConfiguration
 from config_param import (
     COMMUNICATION_DELAY,
@@ -110,6 +111,9 @@ def main():
 
     # Add target node at origin
     builder.add_node(TargetProtocol, (0, 0, 0))
+
+    # Add adversary node at a fixed initial position
+    builder.add_node(AdversaryProtocol, (40, 40, 0))
 
     # Add agent nodes at random positions around the target
     # and randomly vary the desired encirclement radius

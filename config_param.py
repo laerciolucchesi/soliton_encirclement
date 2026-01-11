@@ -9,18 +9,24 @@ configuration parameters used across protocols and other components.
 # --------------------------------------------------------------------------------------
 
 # Base control loop period (seconds)
-CONTROL_PERIOD: float = 0.01
+CONTROL_PERIOD: float = 0.1
 
 # TargetState broadcast period (seconds). Keep equal to control loop by default.
 TARGET_STATE_BROADCAST_PERIOD: float = CONTROL_PERIOD
+
+# AdversaryState broadcast period (seconds). Keep equal to control loop by default.
+ADVERSARY_STATE_BROADCAST_PERIOD: float = CONTROL_PERIOD
 
 # Timer IDs (string keys used by the simulator)
 CONTROL_LOOP_TIMER_STR: str = "control_loop_timer"
 TARGET_STATE_BROADCAST_TIMER_STR: str = "broadcast_timer"
 
+# Adversary timer IDs
+ADVERSARY_STATE_BROADCAST_TIMER_STR: str = "adversary_state_broadcast_timer"
+
 # Simulation defaults (used by main simulation entrypoints)
-SIM_DURATION: float = 600           # Simulation duration (seconds)
-SIM_REAL_TIME: bool = False          # Run in real time
+SIM_DURATION: float = 120           # Simulation duration (seconds)
+SIM_REAL_TIME: bool = True          # Run in real time
 SIM_DEBUG: bool = False             # Enable simulator debug mode
 
 # --------------------------------------------------------------------------------------
@@ -52,7 +58,7 @@ VM_SEND_TELEMETRY: bool = True      # Enable telemetry
 VM_TELEMETRY_DECIMATION: int = 1    # Send telemetry every update
 
 # --------------------------------------------------------------------------------------
-# 4) Target motion (optional)
+# 4a) Target motion (optional)
 # --------------------------------------------------------------------------------------
 
 # Move the target with a constant speed setpoint in the XY plane,
@@ -60,7 +66,18 @@ VM_TELEMETRY_DECIMATION: int = 1    # Send telemetry every update
 TARGET_MOTION_TIMER_STR: str = "target_motion_timer"
 TARGET_MOTION_PERIOD: float = 1.0        # change velocity direction every this many seconds
 TARGET_MOTION_SPEED_XY: float = 5.0      # target speed (m/s)
-TARGET_MOTION_BOUNDARY_XY: float = 30.0  # meters; if |x| or |y| exceeds this, steer back to (0,0)
+TARGET_MOTION_BOUNDARY_XY: float = 20.0  # meters; if |x| or |y| exceeds this, steer back to (0,0)
+
+# --------------------------------------------------------------------------------------
+# 4b) Adversary motion (random roaming)
+# --------------------------------------------------------------------------------------
+
+# Adversary random roaming region in XY: [-ADVERSARY_ROAM_BOUND_XY, +ADVERSARY_ROAM_BOUND_XY]
+ADVERSARY_ROAM_BOUND_XY: float = 40.0
+# Minimum allowed distance between adversary and target in XY (meters)
+ADVERSARY_MIN_TARGET_DISTANCE: float = 30.0
+# Nominal adversary roaming speed in XY (m/s)
+ADVERSARY_ROAM_SPEED_XY: float = 4.0
 
 # --------------------------------------------------------------------------------------
 # 5) Failure injection (agent outages)
@@ -103,7 +120,30 @@ PRUNE_EXPIRED_STATES: bool = True
 
 # Swarm/encirclement defaults
 NUM_AGENTS: int = 10                # Number of agent nodes
-ENCIRCLEMENT_RADIUS: float = 25.0   # Desired encirclement radius in meters
+ENCIRCLEMENT_RADIUS: float = 20.0   # Desired encirclement radius in meters
+
+# Desired angular velocity for the whole swarm to spin around the target (rad/s).
+# This value is broadcast by the target inside TargetState.
+TARGET_SWARM_OMEGA_REF: float = 0.1
+
+# Protection angle (degrees): desired protected/covered arc between the two boundary nodes.
+#
+# The controller uses `lambda` as an arc *weight* (dimensionless): at equilibrium, each
+# arc size is proportional to its lambda, and all arcs sum to 360 degrees.
+#
+# We assign one special arc (edge node -> successor) with weight `edge_lambda`, and the
+# other (alive_count-1) arcs with weight 1.0. The complement of the protected arc is the
+# "edge gap":
+#   edge_gap_deg = 360 - PROTECTION_ANGLE_DEG
+#
+# For any desired edge_gap_deg in [0, 360), the corresponding edge_lambda is:
+#   edge_lambda = edge_gap_deg * (alive_count - 1) / (360 - edge_gap_deg)
+#
+# Notes:
+# - PROTECTION_ANGLE_DEG = 360 means edge_gap_deg = 0 => no boundary arc (uniform lambdas=1).
+# - If edge_gap_deg is smaller than the uniform gap (360/alive_count), then edge_lambda < 1 and
+#   the boundary arc is the *smallest* gap (the token should track the minimum gap, not maximum).
+PROTECTION_ANGLE_DEG: float = 90.0
 
 # Minimum effective radius used by the tangential mapping to avoid division by
 # near-zero radii and to keep the angular-rate interpretation well-conditioned.
@@ -174,4 +214,21 @@ K_E_TAU: float = 25.0     # spacing error injection gain (e_tau multiplier)
 # When enabled, the agent forms an omega reference from its two neighbors and
 # subtracts a proportional term from the spacing error injection:
 #   e_tau_eff = e_tau - K_OMEGA_DAMP * (omega_self - omega_ref)
-K_OMEGA_DAMP: float = 0.1  # angular-rate damping gain (0.0 to disable)
+K_OMEGA_DAMP: float = 0.2  # angular-rate damping gain (0.0 to disable)
+
+# --------------------------------------------------------------------------------------
+# 10) Spin Controller (Proportional & Derivative terms)
+# --------------------------------------------------------------------------------------
+
+# PD controller for omega_ref generation (based on angular error in radians).
+# - If KP=KD=0: omega_ref = TARGET_SWARM_OMEGA_REF (pure open-loop spin)
+# - Otherwise:  omega_ref = KP * err + KD * derr (no constant bias)
+TARGET_SWARM_OMEGA_PD_KP: float = 1.0
+TARGET_SWARM_OMEGA_PD_KD: float = 0.2
+TARGET_SWARM_OMEGA_PD_MAX_ABS: float = 1.0
+
+# If the swarm is close to uniformly distributed, the sum of unit vectors
+# target->agents has near-zero magnitude and its direction becomes ill-defined.
+# This threshold (Kuramoto-like rho in [0,1]) disables the angular error when
+# rho is too small, avoiding a fixed-direction bias.
+TARGET_SWARM_SPIN_RHO_MIN: float = 0.05

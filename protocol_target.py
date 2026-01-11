@@ -26,8 +26,14 @@ import json
 from config_param import (
     AGENT_STATE_TIMEOUT,
     ENCIRCLEMENT_RADIUS,
+    PROTECTION_ANGLE_DEG,
     PRUNE_EXPIRED_STATES,
     SIM_DEBUG,
+    TARGET_SWARM_OMEGA_REF,
+    TARGET_SWARM_OMEGA_PD_KP,
+    TARGET_SWARM_OMEGA_PD_KD,
+    TARGET_SWARM_OMEGA_PD_MAX_ABS,
+    TARGET_SWARM_SPIN_RHO_MIN,
     TARGET_MOTION_BOUNDARY_XY,
     TARGET_MOTION_PERIOD,
     TARGET_MOTION_SPEED_XY,
@@ -35,7 +41,7 @@ from config_param import (
     TARGET_STATE_BROADCAST_PERIOD,
     TARGET_STATE_BROADCAST_TIMER_STR,
 )
-from protocol_messages import AgentState, TargetState
+from protocol_messages import AdversaryState, AgentState, TargetState
 
 
 class TargetProtocol(IProtocol):
@@ -71,6 +77,247 @@ class TargetProtocol(IProtocol):
         # Stored as (state, rxtime) to support timeout detection.
         self.agent_states: Dict[int, Tuple[AgentState, float]] = {}
         self.last_seq_agent: Dict[int, int] = {}
+        # Map of alive agents -> lp (lambda) weight used for non-uniform spacing.
+        self.alive_lambdas: Dict[int, float] = {}
+
+        # Latest received AdversaryState (best-effort), used for omega_ref control.
+        self.adversary_state: Optional[Tuple[AdversaryState, float]] = None
+        self.last_seq_adversary: int = -1
+
+        # PD state for omega_ref control
+        self._omega_err_prev: Optional[float] = None
+        self._omega_err_prev_time: Optional[float] = None
+
+
+        # Exactly one alive agent should hold the edge lambda value.
+        # The holder is determined geometrically from the current formation (largest angular gap).
+        # The value itself is dynamic and depends on alive_count and PROTECTION_ANGLE_DEG.
+        self._special_lambda_value: float = 27.0
+        self._special_agent_id: Optional[int] = None
+
+        # Anti-chattering controls for token transfers.
+        # - cooldown: minimum time between transfers
+        # - hysteresis: require the new max gap to exceed the current holder's arc gap by this margin
+        self._special_last_switch_time: float = -1e9
+        self._special_cooldown_s: float = 1.0
+        self._special_hysteresis_rad: float = 0.05
+
+    @staticmethod
+    def _wrap_to_pi(angle: float) -> float:
+        """Wrap an angle to (-pi, pi]."""
+        two_pi = 2.0 * math.pi
+        a = (float(angle) + math.pi) % two_pi
+        a -= math.pi
+        return float(a)
+
+    @staticmethod
+    def _unit2(vec, eps: float = 1e-6) -> tuple[tuple[float, float], float]:
+        x = float(vec[0])
+        y = float(vec[1])
+        n = math.hypot(x, y)
+        if not (math.isfinite(n) and n > eps):
+            return (1.0, 0.0), 0.0
+        return (x / n, y / n), float(n)
+
+    @staticmethod
+    def _signed_angle(u_from: tuple[float, float], u_to: tuple[float, float]) -> float:
+        """Signed angle (rad) from u_from to u_to in the XY plane."""
+        ax, ay = float(u_from[0]), float(u_from[1])
+        bx, by = float(u_to[0]), float(u_to[1])
+        dot = ax * bx + ay * by
+        cross = ax * by - ay * bx
+        return float(math.atan2(cross, dot))
+
+    def _compute_sorted_angles(self, *, target_pos: Tuple[float, float, float]) -> list[tuple[float, int]]:
+        two_pi = 2.0 * math.pi
+        angles_and_ids: list[tuple[float, int]] = []
+        for aid, (state, _rxtime) in self.agent_states.items():
+            dx = float(state.position[0] - target_pos[0])
+            dy = float(state.position[1] - target_pos[1])
+            theta = math.atan2(dy, dx)
+            if not math.isfinite(theta):
+                continue
+            theta = (theta + two_pi) % two_pi
+            angles_and_ids.append((theta, int(aid)))
+        angles_and_ids.sort(key=lambda t: t[0])
+        return angles_and_ids
+
+    def _gap_of_arc_start(self, angles_and_ids: list[tuple[float, int]], arc_start_id: int) -> Optional[float]:
+        if not angles_and_ids:
+            return None
+        two_pi = 2.0 * math.pi
+        ids = [aid for (_t, aid) in angles_and_ids]
+        if arc_start_id not in ids:
+            return None
+        i = ids.index(int(arc_start_id))
+        theta_i = float(angles_and_ids[i][0])
+        theta_next = float(angles_and_ids[(i + 1) % len(angles_and_ids)][0])
+        gap = (theta_next - theta_i) % two_pi
+        return float(gap) if math.isfinite(gap) else None
+
+    def _max_gap_predecessor(self, angles_and_ids: list[tuple[float, int]]) -> Optional[tuple[int, float]]:
+        """Return (arc_start_id, max_gap) where max_gap is the largest angular gap.
+
+        With the arc-based convention, the node that should receive lambda=27 is the
+        predecessor of the largest gap, i.e., the start of that arc (node -> successor).
+        """
+        if not angles_and_ids:
+            return None
+        two_pi = 2.0 * math.pi
+        best_gap = -1.0
+        best_id: Optional[int] = None
+        n = len(angles_and_ids)
+        for i in range(n):
+            theta_i, aid_i = angles_and_ids[i]
+            theta_next, _aid_next = angles_and_ids[(i + 1) % n]
+            gap = (float(theta_next) - float(theta_i)) % two_pi
+            if not math.isfinite(gap):
+                continue
+            if gap > best_gap:
+                best_gap = gap
+                best_id = int(aid_i)
+        if best_id is None or not math.isfinite(best_gap):
+            return None
+        return int(best_id), float(best_gap)
+
+    def _min_gap_predecessor(self, angles_and_ids: list[tuple[float, int]]) -> Optional[tuple[int, float]]:
+        """Return (arc_start_id, min_gap) where min_gap is the smallest angular gap."""
+        if not angles_and_ids:
+            return None
+        two_pi = 2.0 * math.pi
+        best_gap = float("inf")
+        best_id: Optional[int] = None
+        n = len(angles_and_ids)
+        for i in range(n):
+            theta_i, aid_i = angles_and_ids[i]
+            theta_next, _aid_next = angles_and_ids[(i + 1) % n]
+            gap = (float(theta_next) - float(theta_i)) % two_pi
+            if not math.isfinite(gap):
+                continue
+            if gap < best_gap:
+                best_gap = gap
+                best_id = int(aid_i)
+        if best_id is None or not math.isfinite(best_gap) or best_gap == float("inf"):
+            return None
+        return int(best_id), float(best_gap)
+
+    def _update_special_lambda_by_geometry(self, *, now: float, target_pos: Tuple[float, float, float]) -> None:
+        """Assign the edge lambda to the predecessor of the extreme gap among alive agents.
+
+        If edge_lambda > 1, the boundary arc is the largest gap.
+        If edge_lambda < 1, the boundary arc is the smallest gap.
+        """
+        alive_ids = list(self.agent_states.keys())
+        if not alive_ids:
+            self._special_agent_id = None
+            return
+
+        # Ensure alive agents have explicit lambdas.
+        for aid in alive_ids:
+            if aid not in self.alive_lambdas:
+                self.alive_lambdas[aid] = 1.0
+
+        angles_and_ids = self._compute_sorted_angles(target_pos=target_pos)
+        if not angles_and_ids:
+            # Fallback: pick deterministic holder.
+            self._assign_special_lambda(int(sorted(alive_ids)[0]))
+            self._special_last_switch_time = float(now)
+            return
+
+        track_max = float(self._special_lambda_value) >= (1.0 + 1e-6)
+        candidate = self._max_gap_predecessor(angles_and_ids) if track_max else self._min_gap_predecessor(angles_and_ids)
+        if candidate is None:
+            return
+        candidate_id, max_gap = candidate
+
+        current_id = self._special_agent_id
+        if current_id is not None and current_id not in self.agent_states:
+            current_id = None
+
+        if current_id is None:
+            self._assign_special_lambda(candidate_id)
+            self._special_last_switch_time = float(now)
+            return
+
+        # Keep the invariant even if maps drift.
+        if candidate_id == int(current_id):
+            self._assign_special_lambda(int(current_id))
+            return
+
+        # Cooldown before switching.
+        if (float(now) - float(self._special_last_switch_time)) < float(self._special_cooldown_s):
+            return
+
+        current_gap = self._gap_of_arc_start(angles_and_ids, int(current_id))
+        if current_gap is None:
+            # If we can't compute current gap, allow switch.
+            self._assign_special_lambda(candidate_id)
+            self._special_last_switch_time = float(now)
+            return
+
+        if track_max:
+            # Hysteresis: require candidate max gap to be sufficiently larger than current holder's gap.
+            if float(max_gap) <= float(current_gap) + float(self._special_hysteresis_rad):
+                return
+        else:
+            # Hysteresis (min-gap tracking): require candidate min gap to be sufficiently smaller.
+            if float(max_gap) >= float(current_gap) - float(self._special_hysteresis_rad):
+                return
+
+        self._assign_special_lambda(candidate_id)
+        self._special_last_switch_time = float(now)
+
+    def _assign_special_lambda(self, agent_id: int) -> None:
+        agent_id_int = int(agent_id)
+
+        # Ensure all currently known alive agents have a defined lambda.
+        for aid in list(self.agent_states.keys()):
+            if aid not in self.alive_lambdas:
+                self.alive_lambdas[aid] = 1.0
+
+        # Enforce uniqueness of the special lambda.
+        for aid in list(self.alive_lambdas.keys()):
+            self.alive_lambdas[aid] = 1.0
+
+        self.alive_lambdas[agent_id_int] = float(self._special_lambda_value)
+        self._special_agent_id = agent_id_int
+
+    def _pick_predecessor_by_angle(self, *, angle_ref: float, target_pos: Tuple[float, float, float], alive_ids: list[int]) -> int:
+        """Pick the predecessor (in sorted target-centric angle order) of a reference angle.
+
+        This implements the policy for transferring the special lambda when its owner fails.
+
+        Rationale (arc-based lambda interpretation):
+        - A node's lambda applies to the arc (node -> successor).
+        - If the node holding lambda=27 fails, assigning 27 to its predecessor makes the new
+          enlarged arc span across the failed node's location, preserving the formation shape.
+        """
+        two_pi = 2.0 * math.pi
+        angles_and_ids: list[tuple[float, int]] = []
+        for aid in alive_ids:
+            entry = self.agent_states.get(aid)
+            if entry is None:
+                continue
+            state, _ = entry
+            dx = float(state.position[0] - target_pos[0])
+            dy = float(state.position[1] - target_pos[1])
+            theta = math.atan2(dy, dx)
+            if not math.isfinite(theta):
+                continue
+            theta = (theta + two_pi) % two_pi
+            angles_and_ids.append((theta, aid))
+
+        if not angles_and_ids:
+            return int(alive_ids[0])
+
+        angles_and_ids.sort(key=lambda t: t[0])
+        angles = [t[0] for t in angles_and_ids]
+        ids = [t[1] for t in angles_and_ids]
+
+        # Find where angle_ref would be inserted to keep ordering; predecessor is just before.
+        idx = bisect_right(angles, float(angle_ref))
+        pred_idx = (idx - 1) % len(ids)
+        return int(ids[pred_idx])
     
     def schedule_broadcast_timer(self):
         self.provider.schedule_timer(TARGET_STATE_BROADCAST_TIMER_STR, self.provider.current_time() + self.target_state_broadcast_period)
@@ -81,16 +328,136 @@ class TargetProtocol(IProtocol):
     def handle_timer(self, timer: str):
         self._logger.debug("Target %s: handle_timer called with timer=%s", self.node_id, timer)
         if timer == TARGET_STATE_BROADCAST_TIMER_STR:
+            # Keep internal tracking consistent before broadcasting.
+            now = float(self.provider.current_time())
+            self._prune_expired_states(now)
+
             # Get current position and velocity from the mobility handler
             position = self.velocity_handler.get_node_position(self.node_id) 
             velocity = self.velocity_handler.get_node_velocity(self.node_id)
             seq = self.target_state_seq # Get current sequence number
+
+            if position is None:
+                position = (0.0, 0.0, 0.0)
+            if velocity is None:
+                velocity = (0.0, 0.0, 0.0)
+
+            # Dynamic edge lambda value based on the current number of alive agents.
+            alive_count = int(len(self.agent_states))
+
+            # --- omega_ref control (runs at broadcast period, typically CONTROL_PERIOD) ---
+            # Vector 1 (unit): target -> adversary.
+            adv_unit = (1.0, 0.0)
+            if self.adversary_state is not None:
+                adv_state, _adv_rx = self.adversary_state
+                dx = float(adv_state.position[0] - position[0])
+                dy = float(adv_state.position[1] - position[1])
+                adv_unit, _ = self._unit2((dx, dy))
+
+            # Vector 2 (unit): normalized sum of unit vectors target -> alive agents.
+            sx = 0.0
+            sy = 0.0
+            for _aid, (astate, _rxt) in self.agent_states.items():
+                dx = float(astate.position[0] - position[0])
+                dy = float(astate.position[1] - position[1])
+                u, _n = self._unit2((dx, dy))
+                sx += float(u[0])
+                sy += float(u[1])
+            swarm_unit, swarm_sum_norm = self._unit2((sx, sy))
+
+            # If the swarm is close to uniform, the resultant direction is ill-defined.
+            # Use rho = ||sum||/N as a reliability measure and disable the error when small.
+            n_agents = max(0, int(len(self.agent_states)))
+            rho = 0.0
+            if n_agents > 0 and math.isfinite(swarm_sum_norm):
+                rho = float(swarm_sum_norm) / float(n_agents)
+
+            # Angular error: signed angle from swarm vector to adversary vector.
+            if math.isfinite(rho) and rho >= float(TARGET_SWARM_SPIN_RHO_MIN):
+                err = self._signed_angle(swarm_unit, adv_unit)
+            else:
+                err = 0.0
+
+            # PD on err -> omega_ref.
+            omega_base = float(TARGET_SWARM_OMEGA_REF)
+            kp = float(TARGET_SWARM_OMEGA_PD_KP)
+            kd = float(TARGET_SWARM_OMEGA_PD_KD)
+            max_abs = float(TARGET_SWARM_OMEGA_PD_MAX_ABS)
+            if not math.isfinite(kp):
+                kp = 0.0
+            if not math.isfinite(kd):
+                kd = 0.0
+            if not (math.isfinite(max_abs) and max_abs > 0.0):
+                max_abs = float("inf")
+
+            derr = 0.0
+            if err == 0.0:
+                # Avoid derivative spikes when the direction is ill-defined.
+                self._omega_err_prev = float(err)
+                self._omega_err_prev_time = float(now)
+            elif self._omega_err_prev is not None and self._omega_err_prev_time is not None:
+                dt = float(now - self._omega_err_prev_time)
+                if math.isfinite(dt) and dt > 1e-6:
+                    derr = self._wrap_to_pi(err - float(self._omega_err_prev)) / dt
+
+            # If the PD gains are disabled, keep a pure open-loop spin.
+            # Otherwise, generate omega_ref purely from the angular error (no constant bias).
+            if kp == 0.0 and kd == 0.0:
+                omega_ref = float(omega_base)
+            else:
+                omega_ref = (kp * err) + (kd * derr)
+            if math.isfinite(omega_ref):
+                omega_ref = max(-max_abs, min(max_abs, omega_ref))
+            else:
+                omega_ref = float(omega_base)
+
+            self._omega_err_prev = float(err)
+            self._omega_err_prev_time = float(now)
+
+            # Interpret PROTECTION_ANGLE_DEG as the protected/covered arc; the edge gap is its complement.
+            prot_deg = float(PROTECTION_ANGLE_DEG)
+            if not math.isfinite(prot_deg):
+                prot_deg = 0.0
+            prot_deg = max(0.0, min(360.0, prot_deg))
+            edge_gap_deg = float(360.0 - prot_deg)
+
+            # If there is no edge gap (prot=360) or not enough agents, use uniform lambdas.
+            if alive_count < 2 or edge_gap_deg <= 1e-6:
+                self._special_agent_id = None
+                self._special_lambda_value = 1.0
+                for aid in list(self.agent_states.keys()):
+                    self.alive_lambdas[int(aid)] = 1.0
+            else:
+                # For desired edge_gap_deg in (0, 360), edge_lambda is:
+                #   edge_lambda = edge_gap_deg * (alive_count - 1) / (360 - edge_gap_deg)
+                denom = 360.0 - edge_gap_deg
+                edge_lambda = 1.0
+                if denom > 1e-9:
+                    edge_lambda = float((edge_gap_deg * float(alive_count - 1)) / denom)
+                if not math.isfinite(edge_lambda) or edge_lambda <= 0.0:
+                    edge_lambda = 1.0
+                self._special_lambda_value = float(edge_lambda)
+
+                # Recompute who should hold the edge lambda based on formation geometry.
+                self._update_special_lambda_by_geometry(now=now, target_pos=tuple(position))
+
+            # Populate alive_lambdas with only currently alive agents.
+            # Values come from the target-maintained map, defaulting to 1.0.
+            alive_lambdas = {
+                int(agent_id): float(self.alive_lambdas.get(int(agent_id), 1.0))
+                for agent_id in self.agent_states.keys()
+            }
+            # Keep a local copy too (useful when future logic updates lambdas).
+            self.alive_lambdas = dict(alive_lambdas)
+
             # Create TargetState message
             target_state = TargetState(
                 target_id=self.node_id,
                 seq=seq,
                 position=position,
-                velocity=velocity
+                velocity=velocity,
+                alive_lambdas=alive_lambdas,
+                omega_ref=float(omega_ref),
             )
             message_json = target_state.to_json() # Convert to JSON
             command = CommunicationCommand(CommunicationCommandType.BROADCAST,message_json)
@@ -161,6 +528,26 @@ class TargetProtocol(IProtocol):
 
         msg_type = data.get("type")
 
+        if msg_type == AdversaryState.TYPE:
+            try:
+                state = AdversaryState.from_json(message)
+            except Exception as exc:
+                self._logger.warning("Target %s: failed to decode AdversaryState (%s): %r", self.node_id, exc, message)
+                return
+
+            now = self.provider.current_time()
+            try:
+                seq_int = int(state.seq)
+            except Exception:
+                seq_int = None
+
+            if seq_int is not None and seq_int <= int(self.last_seq_adversary):
+                return
+            if seq_int is not None:
+                self.last_seq_adversary = int(seq_int)
+            self.adversary_state = (state, float(now))
+            return
+
         if msg_type == AgentState.TYPE:
             try:
                 state = AgentState.from_json(message)
@@ -189,6 +576,12 @@ class TargetProtocol(IProtocol):
             if state.agent_id != self.node_id:
                 self.agent_states[state.agent_id] = (state, rxtime)
 
+                # Target is the sole authority for lambda weights.
+                # Initialize on first discovery only.
+                agent_id_int = int(state.agent_id)
+                if agent_id_int not in self.alive_lambdas:
+                    self.alive_lambdas[agent_id_int] = 1.0
+
             if SIM_DEBUG:
                 print(
                     f"Target {self.node_id} received AgentState "
@@ -209,9 +602,13 @@ class TargetProtocol(IProtocol):
             for agent_id, (_, rxtime) in self.agent_states.items()
             if (now - rxtime) > AGENT_STATE_TIMEOUT
         ]
+
+        if self._special_agent_id is not None and self._special_agent_id in expired_agent_ids:
+            self._special_agent_id = None
         for agent_id in expired_agent_ids:
             self.agent_states.pop(agent_id, None)
             self.last_seq_agent.pop(agent_id, None)
+            self.alive_lambdas.pop(agent_id, None)
 
     def handle_telemetry(self, telemetry: Telemetry) -> None:
         if not self._csv_path:
@@ -317,6 +714,9 @@ class TargetProtocol(IProtocol):
                     if i < M - 1:
                         gap = angles[i + 1] - angles[i]
                     else:
+                        # Initialize new agents with lp=1.0 (default). Keep it even if it already exists.
+                        if state.agent_id not in self.alive_lambdas:
+                            self.alive_lambdas[state.agent_id] = 1.0
                         gap = angles[0] + two_pi - angles[-1]
 
                     if not math.isfinite(gap):
