@@ -9,7 +9,7 @@ configuration parameters used across protocols and other components.
 # --------------------------------------------------------------------------------------
 
 # Base control loop period (seconds)
-CONTROL_PERIOD: float = 0.1
+CONTROL_PERIOD: float = 0.01
 
 # TargetState broadcast period (seconds). Keep equal to control loop by default.
 TARGET_STATE_BROADCAST_PERIOD: float = CONTROL_PERIOD
@@ -25,9 +25,17 @@ TARGET_STATE_BROADCAST_TIMER_STR: str = "broadcast_timer"
 ADVERSARY_STATE_BROADCAST_TIMER_STR: str = "adversary_state_broadcast_timer"
 
 # Simulation defaults (used by main simulation entrypoints)
-SIM_DURATION: float = 120           # Simulation duration (seconds)
+SIM_DURATION: float = 120          # Simulation duration (seconds)
 SIM_REAL_TIME: bool = True          # Run in real time
 SIM_DEBUG: bool = False             # Enable simulator debug mode
+
+# --------------------------------------------------------------------------------------
+# Global reproducibility control
+# --------------------------------------------------------------------------------------
+# If True, all randomness (initialization, target/adversary motion, agent failures, etc.)
+# will be seeded deterministically for fully reproducible experiments.
+# If False, all random draws will be non-deterministic (true randomness).
+EXPERIMENT_REPRODUCIBLE: bool = False
 
 # --------------------------------------------------------------------------------------
 # 2) Communication + visualization (medium + UI)
@@ -77,7 +85,7 @@ ADVERSARY_ROAM_BOUND_XY: float = 40.0
 # Minimum allowed distance between adversary and target in XY (meters)
 ADVERSARY_MIN_TARGET_DISTANCE: float = 30.0
 # Nominal adversary roaming speed in XY (m/s)
-ADVERSARY_ROAM_SPEED_XY: float = 4.0
+ADVERSARY_ROAM_SPEED_XY: float = 4.0 #4.0
 
 # --------------------------------------------------------------------------------------
 # 5) Failure injection (agent outages)
@@ -98,7 +106,6 @@ FAILURE_ENABLE: bool = True           # Whether to enable failure injection
 FAILURE_CHECK_PERIOD: float = 0.1     # seconds
 FAILURE_MEAN_FAILURES_PER_MIN: float = 1.0  # mean failures per minute
 FAILURE_OFF_TIME: float = 8.0         # seconds
-FAILURE_RANDOM_SEED = None            # set to an int for reproducibility
 
 # --------------------------------------------------------------------------------------
 # 6) Failure detection and liveness (timeouts, neighbor selection)
@@ -124,7 +131,7 @@ ENCIRCLEMENT_RADIUS: float = 20.0   # Desired encirclement radius in meters
 
 # Desired angular velocity for the whole swarm to spin around the target (rad/s).
 # This value is broadcast by the target inside TargetState.
-TARGET_SWARM_OMEGA_REF: float = 0.1
+TARGET_SWARM_OMEGA_REF: float = 0.0
 
 # Protection angle (degrees): desired protected/covered arc between the two boundary nodes.
 #
@@ -196,11 +203,11 @@ K_DR: float = 0.5
 # Optional alternative to the cubic containment term (-ALPHA_U*u^3):
 #
 # Soft limiter (recommended p=2):
-#   g(u) = u^3 / (1 + (|u|/U_S)^2)
+#   g(u) = u^3 / (1 + (|u|/U_lim)^2)
 #
-# This matches u^3 near u=0, but becomes ~U_S^2*u for |u| >> |U_S|.
+# This matches u^3 near u=0, but becomes ~U_lim^2*u for |u| >> |U_lim|.
 USE_SOFT_LIMITER_U: bool = False  # Whether to use soft limiter on u update
-U_S: float = 2.0                  # Soft limiter scale (only used if USE_SOFT_LIMITER_U is True)
+U_lim: float = 2.0                # Soft limiter scale (only used if USE_SOFT_LIMITER_U is True)
 
 # Tangential controller gains
 K_TAU: float = 0.2        # tangential control gain
@@ -214,11 +221,36 @@ K_E_TAU: float = 25.0     # spacing error injection gain (e_tau multiplier)
 # When enabled, the agent forms an omega reference from its two neighbors and
 # subtracts a proportional term from the spacing error injection:
 #   e_tau_eff = e_tau - K_OMEGA_DAMP * (omega_self - omega_ref)
-K_OMEGA_DAMP: float = 0.2  # angular-rate damping gain (0.0 to disable)
+K_OMEGA_DAMP: float = 0.1  # angular-rate damping gain (0.0 to disable)
+
+# Optional diffusion (discrete Laplacian) on the soliton state u:
+#   + KAPPA_U_DIFF * (u_succ - 2u + u_pred)
+# Helps damp high-frequency spatial oscillations of u along the ring.
+KAPPA_U_DIFF: float = 0.1  # diffusion gain (0.0 to disable)
+
+# Optional additional KdV-like terms (default disabled).
+# Steepening / nonlinear transport:
+#   - K_U_STEEPEN * u * u_s
+# where u_s = (u_succ - u_pred) (central 1-hop; scaling absorbed into the gain).
+#K_U_STEEPEN: float = 0.6
+K_U_STEEPEN: float = 1.2
+
+# Dispersion (KdV-like) using the 1-hop gradient of curvature:
+#   + KAPPA_U_DISP * u_sss
+# where u_sss = (u_ss_succ - u_ss_pred) and u_ss is received from 1-hop neighbors.
+#KAPPA_U_DISP: float = 0.1
+KAPPA_U_DISP: float = 0.2
 
 # --------------------------------------------------------------------------------------
 # 10) Spin Controller (Proportional & Derivative terms)
 # --------------------------------------------------------------------------------------
+
+# Enable/disable the swarm spin controller that tracks the adversary direction.
+# - If False: the target will NOT try to align the swarm spin with the adversary; it will
+#   broadcast omega_ref = TARGET_SWARM_OMEGA_REF (typically 0.0 for no spin).
+# - If True: omega_ref is generated by the PD controller below (with optional open-loop
+#   bias when KP=KD=0).
+TARGET_SWARM_SPIN_ENABLE: bool = True
 
 # PD controller for omega_ref generation (based on angular error in radians).
 # - If KP=KD=0: omega_ref = TARGET_SWARM_OMEGA_REF (pure open-loop spin)

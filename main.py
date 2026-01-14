@@ -41,6 +41,7 @@ from config_param import (
     VM_TAU_Z,
     VM_TELEMETRY_DECIMATION,
     VM_UPDATE_RATE,
+    EXPERIMENT_REPRODUCIBLE,
 )
 import math
 import random
@@ -62,12 +63,16 @@ mobility_config = VelocityMobilityConfiguration(
 def main():
     """Execute the simulation."""
 
+    # Global deterministic randomness for reproducibility across the whole project.
+    if EXPERIMENT_REPRODUCIBLE:
+        random.seed(0)
+
     # Create a shared CSV file for agent telemetry logs.
     # Each agent will append its rows on protocol finish().
     csv_path = os.path.join(os.getcwd(), "agent_telemetry.csv")
     os.environ["AGENT_LOG_CSV_PATH"] = csv_path
     with open(csv_path, "w", encoding="utf-8") as f:
-        f.write("node_id,timestamp,u,velocity_norm\n")
+        f.write("node_id,timestamp,u,u_kdv,u_nom,u_err,delta_u,delta_u_kdv,delta_u_nom,delta_u_err,velocity_norm\n")
 
     # Create a shared CSV file for target telemetry logs.
     # The target will append its rows on protocol finish().
@@ -122,8 +127,10 @@ def main():
     encirclement_radius = ENCIRCLEMENT_RADIUS # Desired encirclement radius in meters
     for i in range(num_agents):
         angle = random.uniform(0, 2 * math.pi)
-        x = encirclement_radius * random.uniform(0.8, 1.2) * math.cos(angle)
-        y = encirclement_radius * random.uniform(0.8, 1.2) * math.sin(angle)
+        # x = encirclement_radius * random.uniform(0.8, 1.2) * math.cos(angle)
+        # y = encirclement_radius * random.uniform(0.8, 1.2) * math.sin(angle)
+        x = encirclement_radius * math.cos(angle)
+        y = encirclement_radius * math.sin(angle)
         z = 0.0 # Keep agents at ground level
         builder.add_node(AgentProtocol, (x, y, z))
 

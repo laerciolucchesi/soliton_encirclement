@@ -96,13 +96,23 @@ This procedure is **local** and may operate under partial visibility.
 
 ### B. Normalized local spacing error (no global $N$)
 
-The controller uses a dimensionless local imbalance error:
+The controller uses a dimensionless local imbalance error. In its most general form it supports
+**arbitrary (non-uniform) spacing** by weighting the two local gaps with per-arc coefficients.
 
 $$
-e_{\tau} = \frac{\text{succ\_gap} - \text{pred\_gap}}{\text{succ\_gap} + \text{pred\_gap}}.
+e_{\tau} = \frac{\lambda_{pred}\,\text{succ\_gap} - \lambda_{self}\,\text{pred\_gap}}{\lambda_{pred}\,\text{succ\_gap} + \lambda_{self}\,\text{pred\_gap}}.
 $$
 
 For positive gaps, $e_{\tau} \in [-1,1]$ and $e_{\tau}=0$ corresponds to local balance.
+
+Uniform spacing is recovered by setting $\lambda_{pred}=\lambda_{self}=1$.
+
+**Implementation note (mapping of $\lambda$):** the target may broadcast a map `alive_lambdas` (carried inside `TargetState`) where each value $\lambda_j$ is associated with the arc $(j \to succ(j))$. Agent $i$ then uses:
+
+- $\lambda_{pred}$ = $\lambda_{i^-}$ (predecessor's arc)
+- $\lambda_{self}$ = $\lambda_i$ (its own successor arc)
+
+Missing entries default to 1.0.
 
 ### C. Optional local damping via angular rate
 
@@ -157,7 +167,7 @@ Nonlinearity $g(\cdot)$:
 - Optional soft limiter (if `USE_SOFT_LIMITER_U=True`):
 
 $$
-g(u) = \frac{u^3}{1+(|u|/U_S)^2}.
+g(u) = \frac{u^3}{1+(|u|/U_lim)^2}.
 $$
 
 ### E. Mapping to tangential velocity

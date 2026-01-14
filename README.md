@@ -119,7 +119,15 @@ This is converted to a 2D vector along the target-centric radial direction and u
 Agents sort neighbors by target-centric angle and pick predecessor/successor in this ring.
 The local spacing imbalance error uses only the two local gaps (in radians):
 
-$$e_\tau = \frac{\Delta\theta_{succ} - \Delta\theta_{pred}}{\Delta\theta_{succ} + \Delta\theta_{pred}}$$
+$$e_\tau = \frac{\lambda_{pred}\,\Delta\theta_{succ} - \lambda_{self}\,\Delta\theta_{pred}}{\lambda_{pred}\,\Delta\theta_{succ} + \lambda_{self}\,\Delta\theta_{pred}}$$
+
+This weighted form enables **arbitrary spacing** (non-uniform desired gaps) without relying on the global agent count $N$.
+In the uniform-spacing case, $\lambda_{pred}=\lambda_{self}=1$ and the expression reduces to the unweighted contrast.
+
+Implementation notes:
+
+- The target can broadcast a per-agent map `alive_lambdas` (in `TargetState`) where each value $\lambda_j$ is associated with the arc $(j \to succ(j))$.
+- Each agent uses $\lambda_{pred}$ for its predecessor arc and $\lambda_{self}$ for its own successor arc (defaults to 1.0 if unavailable).
 
 If gaps are missing/degenerate, `e_tau = 0`.
 

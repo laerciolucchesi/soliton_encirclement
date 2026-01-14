@@ -41,15 +41,18 @@ from config_param import (
     C_COUPLING,
     K_E_TAU,
     K_OMEGA_DAMP,
+    KAPPA_U_DIFF,
+    K_U_STEEPEN,
+    KAPPA_U_DISP,
     USE_SOFT_LIMITER_U,
-    U_S,
+    U_lim,
     FAILURE_CHECK_PERIOD,
     FAILURE_CHECK_TIMER_STR,
     FAILURE_ENABLE,
     FAILURE_MEAN_FAILURES_PER_MIN,
     FAILURE_OFF_TIME,
-    FAILURE_RANDOM_SEED,
     FAILURE_RECOVER_TIMER_STR,
+    EXPERIMENT_REPRODUCIBLE,
 )
 from protocol_messages import AgentState, TargetState
 
@@ -63,22 +66,23 @@ class AgentProtocol(IProtocol):
 
     def initialize(self):
         self.node_id = self.provider.get_id() # Get the node ID from the provider
+
+        # Failure RNG: reproducible per-agent if enabled, else non-deterministic
+        if EXPERIMENT_REPRODUCIBLE:
+            self._failure_rng = random.Random(0xF00DCAFE + int(self.node_id))
+        else:
+            self._failure_rng = random.Random()
+
         self.control_period = CONTROL_PERIOD  # Control loop period in seconds
         # Schedule the control loop timer for the first time
         self.schedule_control_loop_timer()
 
         # Failure injection state
         self._failed: bool = False
-        if FAILURE_ENABLE:
-            if FAILURE_RANDOM_SEED is not None:
-                try:
-                    random.seed(int(FAILURE_RANDOM_SEED) + int(self.node_id))
-                except Exception:
-                    pass
-            # Defer scheduling the first failure-check timer until after
-            # visualization controller initialization. This avoids the case
-            # where a node enters failure before _vis exists and thus isn't
-            # painted red.
+        # Defer scheduling the first failure-check timer until after
+        # visualization controller initialization. This avoids the case
+        # where a node enters failure before _vis exists and thus isn't
+        # painted red.
 
         # Access the VelocityMobilityHandler if available
         handlers = getattr(self.provider, "handlers", {}) or {}
@@ -110,7 +114,22 @@ class AgentProtocol(IProtocol):
         self.agent_state_seq = 1
 
         # Soliton internal state (scalar). Start at zero by default.
+        # Decomposed into three components for analysis:
+        #   u = u_kdv + u_nom + u_err
+        # where u_err integrates the error injection term (K_E_TAU * e_tau).
+        self.u_kdv: float = 0.0
+        self.u_nom: float = 0.0
+        self.u_err: float = 0.0
         self.u: float = 0.0
+
+        # Last per-control-tick increments (dt * du_*) for analysis/telemetry.
+        self.delta_u_kdv: float = 0.0
+        self.delta_u_nom: float = 0.0
+        self.delta_u_err: float = 0.0
+        self.delta_u: float = 0.0
+
+        # Discrete second spatial derivative / curvature of u (1-hop): u_succ - 2*u + u_pred.
+        self.u_ss: float = 0.0
 
         # Last commanded velocity (world coordinates). Used by the optional local
         # angular-rate damping term to estimate omega_self from the command.
@@ -328,32 +347,148 @@ class AgentProtocol(IProtocol):
         if ls is not None and math.isfinite(float(ls)):
             self.lp_succ = float(ls)
 
-    def update_soliton_state(self, *, u: float, u_pred: float, u_succ: float, e_tau: float, dt: float) -> float:
+    def update_soliton_state(
+        self,
+        *,
+        u: float,
+        u_pred: float,
+        u_succ: float,
+        u_ss_pred: float = 0.0,
+        u_ss_succ: float = 0.0,
+        e_tau: float,
+        dt: float,
+    ) -> float:
         """Discrete-time soliton-like internal state update.
 
         u_next = u + dt * (
-            C_COUPLING * (u_succ - u_pred)
+            C_COUPLING * u_s
             - BETA_U * u
-            - ALPHA_U * u^3
+            - ALPHA_U * g(u)
             + K_E_TAU * e_tau
+            + KAPPA_U_DIFF * u_ss
+            - K_U_STEEPEN * u * u_s
+            + KAPPA_U_DISP * u_sss
         )
+
+        Discrete 1-hop definitions (no normalization by Δs; scaling absorbed in gains):
+            u_s   = (u_succ - u_pred)
+            u_ss  = (u_succ - 2u + u_pred)
+            u_sss = (u_ss_succ - u_ss_pred)
+
+        where g(u) is either u^3 (default) or a soft-limited variant when
+        USE_SOFT_LIMITER_U is enabled.
         """
-        if USE_SOFT_LIMITER_U and math.isfinite(U_S) and U_S > 0.0:
+        if USE_SOFT_LIMITER_U and math.isfinite(U_lim) and U_lim > 0.0:
             # Soft limiter with p=2:
-            #   g(u) = u^3 / (1 + (|u|/U_S)^2)
+            #   g(u) = u^3 / (1 + (|u|/U_lim)^2)
             u_abs = abs(u)
             u3 = u * u * u
-            nonlinear = u3 / (1.0 + (u_abs / U_S) * (u_abs / U_S))
+            nonlinear = u3 / (1.0 + (u_abs / U_lim) * (u_abs / U_lim))
         else:
             nonlinear = u * u * u
 
+        # spatial derivative u terms (1-hop, no ds normalization).
+        u_s = float(u_succ - u_pred)
+        u_ss = float(u_succ - 2.0 * u + u_pred)
+        u_sss = float(u_ss_succ - u_ss_pred)
+
         du = (
-            C_COUPLING * (u_succ - u_pred)
+            C_COUPLING * u_s
             - BETA_U * u
             - ALPHA_U * nonlinear
             + K_E_TAU * e_tau
+            + KAPPA_U_DIFF * u_ss
+            - K_U_STEEPEN * u * u_s
+            + KAPPA_U_DISP * u_sss
         )
         return float(u + dt * du)
+
+    def update_soliton_components(
+        self,
+        *,
+        u_kdv: float,
+        u_nom: float,
+        u_err: float,
+        u_pred: float,
+        u_succ: float,
+        u_ss_pred: float = 0.0,
+        u_ss_succ: float = 0.0,
+        e_tau: float,
+        dt: float,
+    ) -> Tuple[float, float, float, float, float, float, float, float]:
+        """Update decomposed soliton state.
+
+        We maintain three internal states such that:
+            u = u_kdv + u_nom + u_err
+
+        - u_kdv integrates the "KdV-like" spatial terms:
+            C_COUPLING*u_s + KAPPA_U_DIFF*u_ss - K_U_STEEPEN*u*u_s + KAPPA_U_DISP*u_sss
+        - u_nom integrates the remaining intrinsic terms:
+            -BETA_U*u - ALPHA_U*g(u)
+        - u_err integrates the error injection term:
+            K_E_TAU*e_tau
+
+        where u, g(u) and the nonlinear steepening term use the total u.
+
+        Returns:
+            (u_kdv_next, u_nom_next, u_err_next, u_next,
+             delta_u_kdv, delta_u_nom, delta_u_err, delta_u_total)
+        """
+        u_total = float(u_kdv + u_nom + u_err)
+
+        if USE_SOFT_LIMITER_U and math.isfinite(U_lim) and U_lim > 0.0:
+            u_abs = abs(u_total)
+            u3 = u_total * u_total * u_total
+            nonlinear = u3 / (1.0 + (u_abs / U_lim) * (u_abs / U_lim))
+        else:
+            nonlinear = u_total * u_total * u_total
+
+        u_s = float(u_succ - u_pred)
+        u_ss = float(u_succ - 2.0 * u_total + u_pred)
+        u_sss = float(u_ss_succ - u_ss_pred)
+
+        du_kdv = (
+            C_COUPLING * u_s
+            + KAPPA_U_DIFF * u_ss
+            - K_U_STEEPEN * u_total * u_s
+            + KAPPA_U_DISP * u_sss
+        )
+        du_nom = (-BETA_U * u_total - ALPHA_U * nonlinear)
+        du_err = (K_E_TAU * e_tau)
+
+        delta_u_kdv = float(dt * du_kdv)
+        delta_u_nom = float(dt * du_nom)
+        delta_u_err = float(dt * du_err)
+        delta_u_total = float(delta_u_kdv + delta_u_nom + delta_u_err)
+
+        u_kdv_next = float(u_kdv + delta_u_kdv)
+        u_nom_next = float(u_nom + delta_u_nom)
+        u_err_next = float(u_err + delta_u_err)
+        u_next = float(u_kdv_next + u_nom_next + u_err_next)
+
+        # Safety: if any component blows up, reset all to 0.
+        if not (
+            math.isfinite(u_kdv_next)
+            and math.isfinite(u_nom_next)
+            and math.isfinite(u_err_next)
+            and math.isfinite(u_next)
+            and math.isfinite(delta_u_kdv)
+            and math.isfinite(delta_u_nom)
+            and math.isfinite(delta_u_err)
+            and math.isfinite(delta_u_total)
+        ):
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+        return (
+            u_kdv_next,
+            u_nom_next,
+            u_err_next,
+            u_next,
+            delta_u_kdv,
+            delta_u_nom,
+            delta_u_err,
+            delta_u_total,
+        )
 
     @staticmethod
     def compute_tangential_velocity(
@@ -539,7 +674,9 @@ class AgentProtocol(IProtocol):
                 p = 0.0
             p = max(0.0, min(1.0, p))
 
-            if p > 0.0 and random.random() < p:
+            rng = getattr(self, "_failure_rng", None)
+            draw = rng.random() if rng is not None else random.random()
+            if p > 0.0 and draw < p:
                 self._failed = True
 
                 if self._vis is not None:
@@ -591,34 +728,13 @@ class AgentProtocol(IProtocol):
             if self._failed:
                 return
             
-            # 1) Broadcast the agent current state
+            # 1) Read local kinematics
             if self.velocity_handler:
                 position = self.velocity_handler.get_node_position(self.node_id)
                 velocity = self.velocity_handler.get_node_velocity(self.node_id)
             else:
                 position = (0.0, 0.0, 0.0)
                 velocity = (0.0, 0.0, 0.0)
-
-            seq = self.agent_state_seq
-
-            agent_state = AgentState(
-                agent_id=self.node_id,
-                seq=seq,
-                position=position,
-                velocity=velocity,
-                u=self.u,
-            )
-            message_json = agent_state.to_json()
-            command = CommunicationCommand(CommunicationCommandType.BROADCAST, message_json)
-            self.provider.send_communication_command(command)
-
-            if SIM_DEBUG:
-                print(
-                    f"Agent {self.node_id} broadcasted AgentState "
-                    f"seq={seq}, position={position}, velocity={velocity}, u={self.u}"
-                )
-
-            self.agent_state_seq = seq + 1
 
             # 2) Neighbor calculations
             now = self.provider.current_time()
@@ -649,6 +765,22 @@ class AgentProtocol(IProtocol):
                     f"theta={theta_str}, pred={pred_id}, succ={succ_id}, "
                     f"pred_gap={pred_gap_str}, succ_gap={succ_gap_str}, alive={alive_count}"
                 )
+
+            # Neighbor soliton states (0.0 if unavailable).
+            u_pred = 0.0
+            u_succ = 0.0
+            if self.neighbor_pred_state is not None:
+                u_pred = float(self.neighbor_pred_state.u)
+            if self.neighbor_succ_state is not None:
+                u_succ = float(self.neighbor_succ_state.u)
+
+            # Neighbor curvature (u_ss) values (0.0 if unavailable / older message).
+            u_ss_pred = 0.0
+            u_ss_succ = 0.0
+            if self.neighbor_pred_state is not None:
+                u_ss_pred = float(getattr(self.neighbor_pred_state, "u_ss", 0.0))
+            if self.neighbor_succ_state is not None:
+                u_ss_succ = float(getattr(self.neighbor_succ_state, "u_ss", 0.0))
 
             # 3) Radial Control loop logic goes here
 
@@ -755,16 +887,16 @@ class AgentProtocol(IProtocol):
                             vel=self.neighbor_succ_state.velocity,
                         )
 
-                    omega_ref = None
+                    omega_ref_local = None
                     if omega_pred is not None and omega_succ is not None:
-                        omega_ref = 0.5 * (omega_pred + omega_succ)
+                        omega_ref_local = 0.5 * (omega_pred + omega_succ)
                     elif omega_pred is not None:
-                        omega_ref = omega_pred
+                        omega_ref_local = omega_pred
                     elif omega_succ is not None:
-                        omega_ref = omega_succ
+                        omega_ref_local = omega_succ
 
-                    if omega_self is not None and omega_ref is not None:
-                        domega = omega_self - omega_ref
+                    if omega_self is not None and omega_ref_local is not None:
+                        domega = omega_self - omega_ref_local
                         if math.isfinite(domega):
                             e_tau_eff = float(e_tau - (K_OMEGA_DAMP * domega))
                         if not math.isfinite(e_tau_eff):
@@ -775,19 +907,28 @@ class AgentProtocol(IProtocol):
                 if not math.isfinite(e_tau_used):
                     e_tau_used = 0.0
 
-                # Neighbor soliton states (0.0 if unavailable).
-                u_pred = 0.0
-                u_succ = 0.0
-                if self.neighbor_pred_state is not None:
-                    u_pred = float(self.neighbor_pred_state.u)
-                if self.neighbor_succ_state is not None:
-                    u_succ = float(self.neighbor_succ_state.u)
-
                 # Update internal soliton state (persistent) and compute tangential velocity.
                 dt = float(self.control_period)
-                self.u = self.update_soliton_state(u=self.u, u_pred=u_pred, u_succ=u_succ, e_tau=e_tau_used, dt=dt)
-                if not math.isfinite(self.u):
-                    self.u = 0.0
+                (
+                    self.u_kdv,
+                    self.u_nom,
+                    self.u_err,
+                    self.u,
+                    self.delta_u_kdv,
+                    self.delta_u_nom,
+                    self.delta_u_err,
+                    self.delta_u,
+                ) = self.update_soliton_components(
+                    u_kdv=self.u_kdv,
+                    u_nom=self.u_nom,
+                    u_err=self.u_err,
+                    u_pred=u_pred,
+                    u_succ=u_succ,
+                    u_ss_pred=u_ss_pred,
+                    u_ss_succ=u_ss_succ,
+                    e_tau=e_tau_used,
+                    dt=dt,
+                )
 
                 # Tangential velocity mapping (linear m/s command):
                 #   v_tau = (K_TAU * u * r_eff) * t_hat
@@ -795,24 +936,59 @@ class AgentProtocol(IProtocol):
                 v_tau = self.compute_tangential_velocity(self.u, t_hat, r_eff=r_eff)
 
                 # Extra global spin term from target broadcast:
-                # target specifies desired angular velocity omega_ref (rad/s);
+                # target specifies desired angular velocity omega_ref_target (rad/s);
                 # tangential speed is v = omega_ref * r_xy.
-                omega_ref = getattr(target_state, "omega_ref", 0.0)
+                omega_ref_target = getattr(target_state, "omega_ref", 0.0)
                 try:
-                    omega_ref = float(omega_ref)
+                    omega_ref_target = float(omega_ref_target)
                 except Exception:
-                    omega_ref = 0.0
+                    omega_ref_target = 0.0
 
-                if math.isfinite(omega_ref) and omega_ref != 0.0 and math.isfinite(r_xy) and r_xy > 1e-6:
-                    v_spin_xy = omega_ref * r_xy
+                if math.isfinite(omega_ref_target) and omega_ref_target != 0.0 and math.isfinite(r_xy) and r_xy > 1e-6:
+                    v_spin_xy = omega_ref_target * r_xy
                     v_spin = (v_spin_xy * t_hat[0], v_spin_xy * t_hat[1], 0.0)
 
                 if SIM_DEBUG:
+                    u_s_dbg = float(u_succ - u_pred)
+                    u_sss_dbg = float(u_ss_succ - u_ss_pred)
                     print(
                         f"Agent {self.node_id} tangential: e_tau={e_tau:.3f}, e_tau_eff={e_tau_eff:.3f}, "
                         f"e_tau_used={e_tau_used:.3f}, "
-                        f"u_pred={u_pred:.3f}, u_succ={u_succ:.3f}, u={self.u:.3f}, v_tau={v_tau}"
+                        f"u_pred={u_pred:.3f}, u_succ={u_succ:.3f}, u={self.u:.3f}, "
+                        f"u_s={u_s_dbg:.3f}, u_sss={u_sss_dbg:.3f}, "
+                        f"K_U_STEEPEN={float(K_U_STEEPEN):.3f}, KAPPA_U_DISP={float(KAPPA_U_DISP):.3f}, "
+                        f"v_tau={v_tau}"
                     )
+
+            # Compute local discrete curvature u_ss (1-hop).
+            # If predecessor/successor are missing, default to 0.0.
+            u_ss_local = 0.0
+            if self.neighbor_pred_state is not None and self.neighbor_succ_state is not None:
+                if math.isfinite(u_pred) and math.isfinite(u_succ) and math.isfinite(self.u):
+                    u_ss_local = float(u_succ - 2.0 * self.u + u_pred)
+            self.u_ss = float(u_ss_local) if math.isfinite(u_ss_local) else 0.0
+
+            # 5) Broadcast the agent current state (after updating u and u_ss)
+            seq = self.agent_state_seq
+            agent_state = AgentState(
+                agent_id=self.node_id,
+                seq=seq,
+                position=position,
+                velocity=velocity,
+                u=self.u,
+                u_ss=self.u_ss,
+            )
+            message_json = agent_state.to_json()
+            command = CommunicationCommand(CommunicationCommandType.BROADCAST, message_json)
+            self.provider.send_communication_command(command)
+
+            if SIM_DEBUG:
+                print(
+                    f"Agent {self.node_id} broadcasted AgentState "
+                    f"seq={seq}, position={position}, velocity={velocity}, u={self.u}, u_ss={self.u_ss}"
+                )
+
+            self.agent_state_seq = seq + 1
 
             # Final velocity composition and single command application.
             # v_cmd = v_rad + v_tau + v_target + v_spin
@@ -918,7 +1094,7 @@ class AgentProtocol(IProtocol):
                 print(
                     f"Agent {self.node_id} received AgentState "
                     f"rxtime={rxtime:.3f}, seq={state.seq}, agent_id={state.agent_id}, position={state.position}, "
-                    f"velocity={state.velocity}, u={state.u}"
+                    f"velocity={state.velocity}, u={state.u}, u_ss={getattr(state, 'u_ss', 0.0)}"
                 )
 
             if state.agent_id != self.node_id:
@@ -949,6 +1125,13 @@ class AgentProtocol(IProtocol):
                 "node_id": int(self.node_id),
                 "timestamp": now,
                 "u": float(self.u),
+                "u_kdv": float(self.u_kdv),
+                "u_nom": float(self.u_nom),
+                "u_err": float(self.u_err),
+                "delta_u": float(self.delta_u),
+                "delta_u_kdv": float(self.delta_u_kdv),
+                "delta_u_nom": float(self.delta_u_nom),
+                "delta_u_err": float(self.delta_u_err),
                 "velocity_norm": v_norm,
             }
         )
@@ -958,7 +1141,22 @@ class AgentProtocol(IProtocol):
             return
 
         try:
-            df = pd.DataFrame(self._telemetry_rows, columns=["node_id", "timestamp", "u", "velocity_norm"])
+            df = pd.DataFrame(
+                self._telemetry_rows,
+                columns=[
+                    "node_id",
+                    "timestamp",
+                    "u",
+                    "u_kdv",
+                    "u_nom",
+                    "u_err",
+                    "delta_u",
+                    "delta_u_kdv",
+                    "delta_u_nom",
+                    "delta_u_err",
+                    "velocity_norm",
+                ],
+            )
 
             # Append without header; main.py already created the file with header.
             # Still guard for the case where the file was removed mid-run.

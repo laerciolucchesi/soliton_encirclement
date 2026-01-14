@@ -2,6 +2,7 @@
 Protocol for the target node.
 """
 import logging
+from bisect import bisect_right
 import math
 import os
 import random
@@ -29,6 +30,7 @@ from config_param import (
     PROTECTION_ANGLE_DEG,
     PRUNE_EXPIRED_STATES,
     SIM_DEBUG,
+    TARGET_SWARM_SPIN_ENABLE,
     TARGET_SWARM_OMEGA_REF,
     TARGET_SWARM_OMEGA_PD_KP,
     TARGET_SWARM_OMEGA_PD_KD,
@@ -346,73 +348,84 @@ class TargetProtocol(IProtocol):
             alive_count = int(len(self.agent_states))
 
             # --- omega_ref control (runs at broadcast period, typically CONTROL_PERIOD) ---
-            # Vector 1 (unit): target -> adversary.
-            adv_unit = (1.0, 0.0)
-            if self.adversary_state is not None:
-                adv_state, _adv_rx = self.adversary_state
-                dx = float(adv_state.position[0] - position[0])
-                dy = float(adv_state.position[1] - position[1])
-                adv_unit, _ = self._unit2((dx, dy))
-
-            # Vector 2 (unit): normalized sum of unit vectors target -> alive agents.
-            sx = 0.0
-            sy = 0.0
-            for _aid, (astate, _rxt) in self.agent_states.items():
-                dx = float(astate.position[0] - position[0])
-                dy = float(astate.position[1] - position[1])
-                u, _n = self._unit2((dx, dy))
-                sx += float(u[0])
-                sy += float(u[1])
-            swarm_unit, swarm_sum_norm = self._unit2((sx, sy))
-
-            # If the swarm is close to uniform, the resultant direction is ill-defined.
-            # Use rho = ||sum||/N as a reliability measure and disable the error when small.
-            n_agents = max(0, int(len(self.agent_states)))
-            rho = 0.0
-            if n_agents > 0 and math.isfinite(swarm_sum_norm):
-                rho = float(swarm_sum_norm) / float(n_agents)
-
-            # Angular error: signed angle from swarm vector to adversary vector.
-            if math.isfinite(rho) and rho >= float(TARGET_SWARM_SPIN_RHO_MIN):
-                err = self._signed_angle(swarm_unit, adv_unit)
-            else:
-                err = 0.0
-
-            # PD on err -> omega_ref.
             omega_base = float(TARGET_SWARM_OMEGA_REF)
-            kp = float(TARGET_SWARM_OMEGA_PD_KP)
-            kd = float(TARGET_SWARM_OMEGA_PD_KD)
-            max_abs = float(TARGET_SWARM_OMEGA_PD_MAX_ABS)
-            if not math.isfinite(kp):
-                kp = 0.0
-            if not math.isfinite(kd):
-                kd = 0.0
-            if not (math.isfinite(max_abs) and max_abs > 0.0):
-                max_abs = float("inf")
 
-            derr = 0.0
-            if err == 0.0:
-                # Avoid derivative spikes when the direction is ill-defined.
+            if not bool(TARGET_SWARM_SPIN_ENABLE):
+                # Spin tracking disabled: do not compute angular error to the adversary.
+                # Keep omega_ref at the configured base value (usually 0.0).
+                omega_ref = float(omega_base)
+                # Reset PD memory so that re-enabling doesn't create derivative spikes.
+                self._omega_err_prev = None
+                self._omega_err_prev_time = None
+            else:
+                # Vector 1 (unit): target -> adversary.
+                adv_unit = (1.0, 0.0)
+                if self.adversary_state is not None:
+                    adv_state, _adv_rx = self.adversary_state
+                    dx = float(adv_state.position[0] - position[0])
+                    dy = float(adv_state.position[1] - position[1])
+                    adv_unit, _ = self._unit2((dx, dy))
+
+                # Vector 2 (unit): normalized sum of unit vectors target -> alive agents.
+                sx = 0.0
+                sy = 0.0
+                for _aid, (astate, _rxt) in self.agent_states.items():
+                    dx = float(astate.position[0] - position[0])
+                    dy = float(astate.position[1] - position[1])
+                    u, _n = self._unit2((dx, dy))
+                    sx += float(u[0])
+                    sy += float(u[1])
+                swarm_unit, swarm_sum_norm = self._unit2((sx, sy))
+
+                # If the swarm is close to uniform, the resultant direction is ill-defined.
+                # Use rho = ||sum||/N as a reliability measure and disable the error when small.
+                n_agents = max(0, int(len(self.agent_states)))
+                rho = 0.0
+                if n_agents > 0 and math.isfinite(swarm_sum_norm):
+                    rho = float(swarm_sum_norm) / float(n_agents)
+
+                # Angular error: signed angle from swarm vector to adversary vector.
+                if math.isfinite(rho) and rho >= float(TARGET_SWARM_SPIN_RHO_MIN):
+                    err = self._signed_angle(swarm_unit, adv_unit)
+                else:
+                    err = 0.0
+
+                # PD on err -> omega_ref.
+                kp = float(TARGET_SWARM_OMEGA_PD_KP)
+                kd = float(TARGET_SWARM_OMEGA_PD_KD)
+                max_abs = float(TARGET_SWARM_OMEGA_PD_MAX_ABS)
+                if not math.isfinite(kp):
+                    kp = 0.0
+                if not math.isfinite(kd):
+                    kd = 0.0
+                if not (math.isfinite(max_abs) and max_abs > 0.0):
+                    max_abs = float("inf")
+
+                derr = 0.0
+                if err == 0.0:
+                    # Avoid derivative spikes when the direction is ill-defined.
+                    self._omega_err_prev = float(err)
+                    self._omega_err_prev_time = float(now)
+                elif self._omega_err_prev is not None and self._omega_err_prev_time is not None:
+                    dt = float(now - self._omega_err_prev_time)
+                    if math.isfinite(dt) and dt > 1e-6:
+                        derr = self._wrap_to_pi(err - float(self._omega_err_prev)) / dt
+
+                # If the PD gains are disabled, keep a pure open-loop spin.
+                # Otherwise, generate omega_ref purely from the angular error (no constant bias).
+                if kp == 0.0 and kd == 0.0:
+                    omega_ref = float(omega_base)
+                else:
+                    omega_ref = (kp * err) + (kd * derr)
+                if math.isfinite(omega_ref):
+                    omega_ref = max(-max_abs, min(max_abs, omega_ref))
+                else:
+                    omega_ref = float(omega_base)
+
                 self._omega_err_prev = float(err)
                 self._omega_err_prev_time = float(now)
-            elif self._omega_err_prev is not None and self._omega_err_prev_time is not None:
-                dt = float(now - self._omega_err_prev_time)
-                if math.isfinite(dt) and dt > 1e-6:
-                    derr = self._wrap_to_pi(err - float(self._omega_err_prev)) / dt
 
-            # If the PD gains are disabled, keep a pure open-loop spin.
-            # Otherwise, generate omega_ref purely from the angular error (no constant bias).
-            if kp == 0.0 and kd == 0.0:
-                omega_ref = float(omega_base)
-            else:
-                omega_ref = (kp * err) + (kd * derr)
-            if math.isfinite(omega_ref):
-                omega_ref = max(-max_abs, min(max_abs, omega_ref))
-            else:
-                omega_ref = float(omega_base)
-
-            self._omega_err_prev = float(err)
-            self._omega_err_prev_time = float(now)
+                # end TARGET_SWARM_SPIN_ENABLE
 
             # Interpret PROTECTION_ANGLE_DEG as the protected/covered arc; the edge gap is its complement.
             prot_deg = float(PROTECTION_ANGLE_DEG)
