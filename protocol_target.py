@@ -866,3 +866,10 @@ class TargetProtocol(IProtocol):
                 self._csv_path,
             )
 
+        # print average metrics to console
+        df_avg = df.mean(numeric_only=True)
+        print(  f"Target telemetry averages: "
+                f"E_r={df_avg['E_r']:.6f}, E_vr={df_avg['E_vr']:.6f}, "
+                f"rho={df_avg['rho']:.6f}, G_max={df_avg['G_max']:.6f}, E_gap={df_avg['E_gap']:.6f}"
+            )
+

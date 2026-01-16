@@ -127,10 +127,10 @@ def main():
     encirclement_radius = ENCIRCLEMENT_RADIUS # Desired encirclement radius in meters
     for i in range(num_agents):
         angle = random.uniform(0, 2 * math.pi)
-        # x = encirclement_radius * random.uniform(0.8, 1.2) * math.cos(angle)
-        # y = encirclement_radius * random.uniform(0.8, 1.2) * math.sin(angle)
-        x = encirclement_radius * math.cos(angle)
-        y = encirclement_radius * math.sin(angle)
+        x = encirclement_radius * random.uniform(0.8, 1.2) * math.cos(angle)
+        y = encirclement_radius * random.uniform(0.8, 1.2) * math.sin(angle)
+        # x = encirclement_radius * math.cos(angle)
+        # y = encirclement_radius * math.sin(angle)
         z = 0.0 # Keep agents at ground level
         builder.add_node(AgentProtocol, (x, y, z))
 

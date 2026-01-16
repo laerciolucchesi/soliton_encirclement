@@ -25,8 +25,8 @@ TARGET_STATE_BROADCAST_TIMER_STR: str = "broadcast_timer"
 ADVERSARY_STATE_BROADCAST_TIMER_STR: str = "adversary_state_broadcast_timer"
 
 # Simulation defaults (used by main simulation entrypoints)
-SIM_DURATION: float = 120          # Simulation duration (seconds)
-SIM_REAL_TIME: bool = True          # Run in real time
+SIM_DURATION: float = 1200          # Simulation duration (seconds)
+SIM_REAL_TIME: bool = False          # Run in real time
 SIM_DEBUG: bool = False             # Enable simulator debug mode
 
 # --------------------------------------------------------------------------------------
@@ -232,14 +232,14 @@ KAPPA_U_DIFF: float = 0.1  # diffusion gain (0.0 to disable)
 # Steepening / nonlinear transport:
 #   - K_U_STEEPEN * u * u_s
 # where u_s = (u_succ - u_pred) (central 1-hop; scaling absorbed into the gain).
-#K_U_STEEPEN: float = 0.6
-K_U_STEEPEN: float = 1.2
+#K_U_STEEPEN: float = 3.0
+K_U_STEEPEN: float = 0.3
 
 # Dispersion (KdV-like) using the 1-hop gradient of curvature:
 #   + KAPPA_U_DISP * u_sss
 # where u_sss = (u_ss_succ - u_ss_pred) and u_ss is received from 1-hop neighbors.
-#KAPPA_U_DISP: float = 0.1
-KAPPA_U_DISP: float = 0.2
+#KAPPA_U_DISP: float = 0.2
+KAPPA_U_DISP: float = 0.05
 
 # --------------------------------------------------------------------------------------
 # 10) Spin Controller (Proportional & Derivative terms)
