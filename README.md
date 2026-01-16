@@ -1,4 +1,5 @@
 # Soliton Encirclement
+# Baseline v1 (before v2 refactor)
 
 Soliton-inspired swarm encirclement experiment for the
 [GrADyS-SIM NG](https://github.com/Project-GrADyS/gradys-sim-nextgen) simulator.
